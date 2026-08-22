@@ -10,7 +10,6 @@
  *   /agents                 — Interactive agent management menu
  */
 
-import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
@@ -21,7 +20,7 @@ import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, serializeAgentFile } from "./agent-file-toggle.js";
 import { AgentManager } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
-import { BUILTIN_TOOL_NAMES, clearSkillAgents, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, getSkillAliasDecisions, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent, setSkillAgents } from "./agent-types.js";
+import { BUILTIN_TOOL_NAMES, buildAgentRegistry, clearSkillAgents, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, getSkillAliasDecisions, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent, setSkillAgents } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
 import { AGENT_ENDED_CHANNEL, createAgentEndedGate, type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
@@ -36,18 +35,7 @@ import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, set
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
-import { SkillAgentsController } from "./skill-agents.js";
-import {
-  type RpcReply,
-  SKILL_AGENTS_QUERY_CHANNEL,
-  SKILL_AGENTS_REWRITE_MAPS_CHANNEL,
-  SKILLS_CHANGED_CHANNEL,
-  SKILLS_QUERY_CHANNEL,
-  type SkillAgentRewriteMapsEvent,
-  type SkillSetSnapshot,
-  skillAgentsQueryReplyChannel,
-  skillsQueryReplyChannel,
-} from "./skills-contract.js";
+import { SkillAgentsAdapter } from "./skill-agents-adapter.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
@@ -293,11 +281,44 @@ export function formatToolsSuffix(cfg: AgentConfig | undefined): string {
   return isFullSet ? "*" : tools.join(", ");
 }
 
+/**
+ * A child subagent session's half of the A.9 seam (S4). The rest of this
+ * extension deliberately does not run in a child (see the early return below),
+ * but the child builds its own `SkillRuntime`, which pulls `skill-agents:query`
+ * on the child's own bus. Leaving that pull unanswered means a skill loaded
+ * inside a subagent never has a collided bare agent name rewritten to its
+ * qualified form — the cross-wiring the seam exists to prevent.
+ *
+ * Alias decisions come from a registry built for this branch's config root, the
+ * same pure path nested tools use, so a child never disturbs the root's
+ * process-global registry.
+ */
+function bindChildSkillAgents(pi: ExtensionAPI): void {
+  let adapter: SkillAgentsAdapter | undefined;
+  pi.on("session_start", (_event, ctx) => {
+    if (adapter) return;  // duplicate session_start delivery (#142)
+    const configCwd = ctx.cwd ?? process.cwd();
+    adapter = new SkillAgentsAdapter(pi.events, (layer) =>
+      buildAgentRegistry(loadCustomAgents(configCwd), { skillAgents: layer }).aliases);
+    adapter.wire();
+  });
+  pi.on("session_shutdown", () => {
+    adapter?.unwire();
+    adapter = undefined;
+  });
+}
+
 export default function (pi: ExtensionAPI) {
   // Child AgentSessions load normal extensions. Re-entering this extension there
   // would create another manager and leak handlers. Nested orchestration is
-  // injected as scoped custom tools by the existing manager instead.
-  if (inChildSessionContext()) return;
+  // injected as scoped custom tools by the existing manager instead — with one
+  // exception: a child session builds its own `SkillRuntime`, which pulls the
+  // rewrite maps on its own bus, so it gets an adapter of its own (S4) and
+  // nothing else. It never touches the global registry.
+  if (inChildSessionContext()) {
+    bindChildSkillAgents(pi);
+    return;
+  }
 
   // ---- Register custom notification renderer ----
   pi.registerMessageRenderer<NotificationDetails>(
@@ -368,10 +389,23 @@ export default function (pi: ExtensionAPI) {
   // the initial load, which happens hundreds of lines before settings are applied.
   let strictAgentFiles = loadSettings(process.cwd()).strictAgentFiles === true;
 
+  /**
+   * Set by the A.9 adapter once it wires, and only on the activation that owns
+   * the global registry. Late-bound because the first reload runs hundreds of
+   * lines before the adapter (and `ownsManagerRegistry`) exists.
+   */
+  let publishRegistryChange: (() => void) | undefined;
+
   /** Reload agents from project/global custom agent dirs and merge with defaults (called on init and each Agent invocation). */
   const reloadCustomAgents = (strict = false) => {
     const userAgents = loadCustomAgents(process.cwd(), strict);
     registerAgents(userAgents);
+    // A rebuild can flip a skill's bare alias without any skill changing: a user
+    // adding `.pi/agents/reviewer.md` steals the name back, and core would keep
+    // rewriting to the old decision until some unrelated `skills:changed` fired.
+    // The controller drops unchanged maps, so this is a serialize and no bus
+    // traffic on the per-spawn path.
+    publishRegistryChange?.();
   };
 
   // Initial load — the only strict one. A bad edit mid-session must not kill the
@@ -539,12 +573,17 @@ export default function (pi: ExtensionAPI) {
     // v3: a terminal event for every transition, carrying the record's native
     // status verbatim (completed | steered | error | aborted | stopped). Core
     // derives ok = !(error|stopped|aborted); no status-normalizing here.
-    agentEndedGate.emit(record.id, {
-      agentId: record.id,
-      status: record.status,
-      ...(record.result !== undefined && { result: record.result }),
-      ...(record.error !== undefined && { error: record.error }),
-    });
+    // The guard narrows to the terminal set rather than asserting it: this
+    // callback only ever runs from a settle path, and core drops a payload whose
+    // status is not one of them anyway.
+    if (record.status !== "queued" && record.status !== "running") {
+      agentEndedGate.emit({
+        agentId: record.id,
+        status: record.status,
+        ...(record.result !== undefined && { result: record.result }),
+        ...(record.error !== undefined && { error: record.error }),
+      });
+    }
 
     // Persist final record for cross-extension history reconstruction
     pi.appendEntry("subagents:record", {
@@ -741,89 +780,31 @@ export default function (pi: ExtensionAPI) {
   }
 
   // ---- A.9 skill-bundled agents adapter (root activation) ----
-  // This extension does not run in child subagent sessions (inChildSessionContext
-  // early-return at the top of the factory), so the adapter is wired once, on the
-  // root's session bus. It consumes core's `skills:changed`/`skills:query` seam
-  // and publishes/answers the `skill-agents:*` rewrite-map seam. Nested subagent
-  // branches still see skill agents through NestedToolContext (frozen input 3),
-  // fed from the root layer via getSkillAgents().
-  const skillAgentsController = new SkillAgentsController();
-  const skillAgentsUnsubs: Array<() => void> = [];
-  let skillAgentsWired = false;
-
-  function isSkillSetSnapshot(data: unknown): data is SkillSetSnapshot {
-    if (typeof data !== "object" || data === null) return false;
-    const snap = data as Partial<SkillSetSnapshot>;
-    return typeof snap.revision === "number" && Array.isArray(snap.skills) && Array.isArray(snap.removed);
-  }
-
-  function publishSkillRewriteMaps(): void {
-    // Root view: alias decisions from the global registry, refreshed by the
-    // reloadCustomAgents in applySkillSnapshot. Publish only when they changed.
-    skillAgentsController.publish(getSkillAliasDecisions(), (event) =>
-      pi.events.emit(SKILL_AGENTS_REWRITE_MAPS_CHANNEL, event));
-  }
-
-  function applySkillSnapshot(snapshot: SkillSetSnapshot): void {
-    const layer = skillAgentsController.ingest(snapshot);
-    if (!layer) return; // stale revision — ignore
-    if (ownsManagerRegistry) {
-      setSkillAgents(layer);
-      reloadCustomAgents();  // rebuild the global registry with the new layer
-      registerAgentTool();   // refresh the Agent tool's roster/description (S3)
-    }
-    publishSkillRewriteMaps();
-  }
-
-  // One-shot pull so an activation that binds after core's initial publication
-  // still gets the snapshot (core re-emits on changes, so a lost pull self-heals).
-  function querySkillSet(): void {
-    const requestId = randomUUID();
-    const replyChannel = skillsQueryReplyChannel(requestId);
-    let settled = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const unsub = pi.events.on(replyChannel, (data: unknown) => {
-      if (settled) return;
-      settled = true;
-      if (timer) clearTimeout(timer);
-      unsub();
-      if (data && typeof data === "object" && (data as { success?: unknown }).success === true) {
-        const snap = (data as { data?: unknown }).data;
-        if (isSkillSetSnapshot(snap)) applySkillSnapshot(snap);
-      }
-    });
-    timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      unsub();
-    }, 2000);
-    timer.unref?.();
-    pi.events.emit(SKILLS_QUERY_CHANNEL, { requestId });
-  }
+  // Wired on this activation's own session bus, against the global registry it
+  // owns. Child sessions run the same adapter over their own bus from the
+  // early-return at the top of this factory; nested subagent branches see skill
+  // agents through NestedToolContext (frozen input 3) via getSkillAgents().
+  const skillAgents = new SkillAgentsAdapter(pi.events, (layer) => {
+    if (!ownsManagerRegistry) return getSkillAliasDecisions();
+    setSkillAgents(layer);
+    reloadCustomAgents();  // rebuilds with the new layer, and publishes the maps it changes
+    registerAgentTool();   // refresh the Agent tool's roster/description (S3)
+    return getSkillAliasDecisions();
+  });
 
   function wireSkillAgents(): void {
-    if (skillAgentsWired) return;
-    skillAgentsWired = true;
-    skillAgentsUnsubs.push(
-      pi.events.on(SKILLS_CHANGED_CHANNEL, (data: unknown) => {
-        if (isSkillSetSnapshot(data)) applySkillSnapshot(data);
-      }),
-    );
-    // Answer rewrite-map pulls (core's SkillRuntime pulls on construction).
-    skillAgentsUnsubs.push(
-      pi.events.on(SKILL_AGENTS_QUERY_CHANNEL, (data: unknown) => {
-        const requestId = (data as { requestId?: unknown })?.requestId;
-        if (typeof requestId !== "string" || requestId.length === 0) return;
-        const reply: RpcReply<SkillAgentRewriteMapsEvent> = { success: true, data: skillAgentsController.current() };
-        pi.events.emit(skillAgentsQueryReplyChannel(requestId), reply);
-      }),
-    );
-    querySkillSet();
+    // Only the registry owner publishes on a plain rebuild: the alias decisions
+    // being diffed are the global registry's, and a non-owning activation's
+    // rebuild says nothing about them.
+    if (ownsManagerRegistry) {
+      publishRegistryChange = () => skillAgents.publish(getSkillAliasDecisions());
+    }
+    skillAgents.wire();
   }
 
   function unwireSkillAgents(): void {
-    for (const unsub of skillAgentsUnsubs.splice(0)) unsub();
-    skillAgentsWired = false;
+    skillAgents.unwire();
+    publishRegistryChange = undefined;
     if (ownsManagerRegistry) clearSkillAgents();
   }
 

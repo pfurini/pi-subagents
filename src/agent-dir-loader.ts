@@ -9,12 +9,12 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { BUILTIN_TOOL_NAMES } from "./agent-types.js";
-import type { AgentConfig, IsolationMode, MemoryScope, ThinkingLevel } from "./types.js";
+import { type AgentConfig, type IsolationMode, type MemoryScope, QUALIFIED_SEPARATOR, type ThinkingLevel } from "./types.js";
 
 /**
- * The one thing a declared `name:` may not contain, matching Claude Code
- * exactly: it reserves `:` for plugin-scoped identifiers (`my-plugin:reviewer`)
- * and refuses to load a file whose name uses one.
+ * The one thing an agent type may not contain, matching Claude Code exactly: it
+ * reserves `:` for plugin-scoped identifiers (`my-plugin:reviewer`) and refuses
+ * to load a file whose name uses one.
  *
  * Nothing else is rejected. Claude Code's docs describe names as "lowercase
  * letters and hyphens", but that is guidance — the only stated load failure is
@@ -24,10 +24,12 @@ import type { AgentConfig, IsolationMode, MemoryScope, ThinkingLevel } from "./t
  * has to be allowed regardless: the built-in types `Explore` and `Plan` use it,
  * and a file must be able to override one.
  *
- * Because `:` is unforgeable from a file, the qualified `skill:agent` names WS2
- * mints for skill-bundled agents cannot be spoofed by a user agent file.
+ * The check covers the declared name AND the filename it falls back to, which is
+ * what keeps the qualified `skill:agent` names WS2 mints unforgeable: no file,
+ * from a user directory or a third-party skill, can produce a type containing
+ * one.
  */
-const RESERVED_IN_TYPE = ":";
+const RESERVED_IN_TYPE = QUALIFIED_SEPARATOR;
 
 /**
  * Load agent configs from one directory into a fresh map. `*.md` files are
@@ -53,9 +55,18 @@ export function loadAgentsFromDirectoryInto(
 ): void {
   if (!existsSync(dir)) return;
 
+  // A skill's directory is third-party content, so its entries are read as data:
+  // `agents/notes.md` shipped as a symlink to ~/.aws/credentials would otherwise
+  // load the target's bytes as an agent's system prompt. The user's own agent
+  // directories keep following symlinks — dotfile setups rely on it.
+  const untrusted = source === "skill" || source === "package";
+
   let files: string[];
   try {
-    files = readdirSync(dir).filter(f => f.endsWith(".md")).sort();
+    files = readdirSync(dir, { withFileTypes: true })
+      .filter(e => e.name.endsWith(".md") && (!untrusted || e.isFile()))
+      .map(e => e.name)
+      .sort();
   } catch {
     return;
   }
@@ -76,24 +87,31 @@ export function loadAgentsFromDirectoryInto(
     // match. Absent, the filename stands in — Claude Code requires the field,
     // but most files here predate it and must keep loading.
     const declared = str(fm.name)?.trim();
-    if (declared?.includes(RESERVED_IN_TYPE)) {
-      // Refusing beats silently substituting: the file would otherwise load
-      // under its filename, so `Agent({subagent_type})` would succeed against
-      // an agent whose declared identity nothing honoured.
-      warnIfNew(
-        `Agent file ${path} declares name "${declared}", which contains "${RESERVED_IN_TYPE}" — reserved for `
-        + "plugin-scoped identifiers. Rename it, or move the label to `display_name:`. Skipping.",
-      );
-      // No `warnSkippedOverride`: this file would have registered under its
-      // *declared* name, which nothing else can hold (a colon keeps it out of
-      // the registry), so it shadowed nothing. Passing the filename instead
-      // would report a substitution of an unrelated agent that never happened.
-      continue;
-    }
     // `||`, not `??`: a quoted empty or all-whitespace `name:` would otherwise
     // register the agent under the empty type — unspawnable, and it takes the
     // filename-derived one down with it.
     const name = declared || filenameType;
+    // The guard covers the *effective* type, declared or filename-derived.
+    // Refusing beats substituting for a declared name: the file would otherwise
+    // load under its filename, so `Agent({subagent_type})` would succeed against
+    // an agent whose declared identity nothing honoured. And a filename is
+    // attacker-chosen for a third-party skill — unchecked, a colon-bearing one
+    // mints a name indistinguishable from another skill's qualified
+    // `skill:agent` entry and overwrites it in the registry.
+    if (name.includes(RESERVED_IN_TYPE)) {
+      warnIfNew(
+        declared
+          ? `Agent file ${path} declares name "${declared}", which contains "${RESERVED_IN_TYPE}" — reserved for `
+            + "plugin-scoped identifiers. Rename it, or move the label to `display_name:`. Skipping."
+          : `Agent file ${path} would register as "${name}", which contains "${RESERVED_IN_TYPE}" — reserved for `
+            + "plugin-scoped identifiers. Rename the file. Skipping.",
+      );
+      // No `warnSkippedOverride`: the rejected name cannot be held by anything
+      // else in this map (a colon keeps it out), so it shadowed nothing.
+      // Passing the filename instead would report a substitution of an
+      // unrelated agent that never happened.
+      continue;
+    }
 
     const { builtinToolNames, extSelectors } = parseToolsField(fm.tools);
 

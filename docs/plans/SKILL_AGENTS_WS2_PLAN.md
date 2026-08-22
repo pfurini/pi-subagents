@@ -222,7 +222,8 @@ every watch/visibility update). Refactor in `src/index.ts`:
 **Per-bound-activation, not root-only.** Every subagent session constructs its
 own `DefaultResourceLoader` — its own event bus, its own `SkillSetController`,
 its own `SkillRuntime` issuing its own `skill-agents:query` pull
-(`src/agent-runner.ts:709-731`, child `bindExtensions` at :951). A root-only
+(`src/agent-runner.ts:709-731`; the runtime is built per session in core's
+`agent-session.ts`). A root-only
 subscription would leave every child/worktree session without rewrite maps and
 without visibility updates on its own bus. So the seam adapter is
 **session-scoped**: each bound activation (root and child alike) wires, on its
@@ -261,6 +262,17 @@ also runs `clearSkillAgents()`. No terminal re-publish.
 Idempotency across duplicate `session_start` delivery and no-listener-at-factory
 follow the existing `#142` pattern (`test/rpc-lifecycle-gating.test.ts` encodes
 it; extend, don't fork, that test).
+
+**Amendment (2026-08-22, during implementation).** The premise above that a
+child activation already binds `session_start` was wrong: this extension's
+factory early-returns under `inChildSessionContext()`
+(`src/index.ts`, pre-dating WS2), so `bindExtensions` fires `session_start` into
+a void and no handler exists to bind. `session_start` alone was never the
+obstacle — the factory returning before registering one was. Implemented as
+specified by narrowing that early return: a child now runs `bindChildSkillAgents`
+and nothing else (no manager, no tools, no commands, no RPC, no readiness
+broadcast), and the shared adapter lives in `src/skill-agents-adapter.ts` so root
+and child wire identical code over their own buses.
 
 ### A1 — Skill-agents adapter (`src/skill-agents.ts`)
 
@@ -475,10 +487,11 @@ suggest a commit message as text.
    there this slice. If review argues users need introspection, the fallback is
    a read-only row with no actions — do not add per-agent disable (frozen 2).
 4. **Child-session layer scope** (S4): the per-activation adapter is the
-   corrected design; the implementation must confirm child activations of this
-   extension actually bind `session_start` on the child session (they do via
-   `bindExtensions`, `agent-runner.ts:951`) and that `NestedToolContext` can
-   carry the session layer without leaking it across branches.
+   corrected design. RESOLVED during implementation — a child activation does
+   NOT bind `session_start` for this extension by default (the factory returns
+   first under `inChildSessionContext()`); the early return was narrowed to run
+   the adapter alone. See the S4 amendment. `NestedToolContext` carries the
+   layer per branch without leaking it across branches.
 
 ## Adversarial review incorporated (2026-08-22, pre-implementation)
 

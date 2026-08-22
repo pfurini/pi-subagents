@@ -7,7 +7,7 @@
 
 import { createCodingTools, createReadOnlyTools } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_AGENTS } from "./default-agents.js";
-import type { AgentConfig } from "./types.js";
+import { type AgentConfig, QUALIFIED_SEPARATOR } from "./types.js";
 
 /**
  * All known built-in tool names, derived from pi's own tool factories rather
@@ -138,9 +138,12 @@ export function buildAgentRegistry(
   const nonSkillLower = new Set([...registry.keys()].map(k => k.toLowerCase()));
 
   // Distinct skills claiming each bare name (case folded): a name claimed by
-  // more than one skill goes to neither (frozen inputs 1 + 5).
+  // more than one skill goes to neither (frozen inputs 1 + 5). A disabled agent
+  // claims nothing — it cannot be spawned under the alias, so letting it block a
+  // sibling skill's identically named agent would deny the name to both.
   const claimants = new Map<string, Set<string>>();
   for (const entry of layer) {
+    if (entry.config.enabled === false) continue;
     const lower = entry.bareName.toLowerCase();
     let set = claimants.get(lower);
     if (!set) { set = new Set(); claimants.set(lower, set); }
@@ -152,10 +155,16 @@ export function buildAgentRegistry(
     registry.set(entry.qualified, skillRegistryConfig(entry, entry.qualified));
   }
 
-  // Bare aliases: granted only when the name is free and singly-claimed.
+  // Bare aliases: granted only when the name is free and singly-claimed. The
+  // separator check is belt and braces — the loader already refuses a colon in
+  // any effective type, and without it a colon-bearing bare name would land in
+  // this pass, which runs last, and overwrite another skill's qualified entry.
   for (const entry of layer) {
     const lower = entry.bareName.toLowerCase();
-    const granted = !nonSkillLower.has(lower) && (claimants.get(lower)?.size ?? 0) === 1;
+    const granted = entry.config.enabled !== false
+      && !entry.bareName.includes(QUALIFIED_SEPARATOR)
+      && !nonSkillLower.has(lower)
+      && (claimants.get(lower)?.size ?? 0) === 1;
     if (granted) {
       registry.set(entry.bareName, skillRegistryConfig(entry, entry.bareName));
     }

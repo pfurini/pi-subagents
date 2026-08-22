@@ -26,7 +26,8 @@ vi.mock("../src/agent-runner.js", async () => {
 });
 
 import { runAgent } from "../src/agent-runner.js";
-import { clearSkillAgents, getSkillAgents, isValidType } from "../src/agent-types.js";
+import { clearSkillAgents, getSkillAgents, isValidType, registerAgents } from "../src/agent-types.js";
+import { runInChildSessionContext } from "../src/child-context.js";
 import subagentsExtension from "../src/index.js";
 
 const RPC_CHANNELS = ["subagents:rpc:ping", "subagents:rpc:spawn", "subagents:rpc:stop"] as const;
@@ -44,7 +45,11 @@ function makePi() {
       emit: vi.fn(),
       on: vi.fn((event: string, handler: any) => {
         busHandlers.set(event, handler);
-        return vi.fn();
+        // A real remover, so a test can assert that unwiring actually stops
+        // delivery rather than that some function was returned.
+        return vi.fn(() => {
+          if (busHandlers.get(event) === handler) busHandlers.delete(event);
+        });
       }),
     },
     appendEntry: vi.fn(),
@@ -249,7 +254,7 @@ describe("A.9 skill-agents adapter lifecycle (S4)", () => {
     process.env.PI_CODING_AGENT_DIR = agentDir;
     process.env.HOME = agentDir;
     prevCwd = process.cwd();
-    mkdirSync(join(tmpDir, ".pi"), { recursive: true });
+    mkdirSync(join(tmpDir, ".pi", "agents"), { recursive: true });
     writeFileSync(join(tmpDir, ".pi", "subagents.json"), JSON.stringify({ schedulingEnabled: false }));
     process.chdir(tmpDir);
     // Free the process-global manager slot so this extension instance is the
@@ -387,5 +392,70 @@ describe("A.9 skill-agents adapter lifecycle (S4)", () => {
 
     await lifecycle.get("session_shutdown")();
     expect(getSkillAgents()).toBeUndefined();
+  });
+
+  // A child subagent session has its own resource loader, event bus and
+  // SkillRuntime, and that runtime pulls the rewrite maps on the CHILD's bus. The
+  // root's adapter cannot answer it, so a child gets an adapter of its own — and
+  // nothing else from this extension.
+  describe("child session activation", () => {
+    const bootChild = async (pi: any, lifecycle: Map<string, any>) => {
+      await runInChildSessionContext(async () => { subagentsExtension(pi); });
+      await lifecycle.get("session_start")({}, ctx());
+    };
+
+    // Earlier tests in this file leave their skill agents in the process-global
+    // registry; reset it so "the child did not touch it" is a real assertion.
+    beforeEach(() => {
+      clearSkillAgents();
+      registerAgents(new Map());
+    });
+
+    it("wires the seam on the child's own bus", async () => {
+      const { pi, lifecycle, busHandlers } = makePi();
+      await bootChild(pi, lifecycle);
+
+      expect(busHandlers.has("skills:changed")).toBe(true);
+      expect(busHandlers.has("skill-agents:query")).toBe(true);
+      expect(emitsOn(pi, "skills:query")).toHaveLength(1);
+    });
+
+    it("registers nothing else: no tools, no RPC handlers, no readiness", async () => {
+      const { pi, lifecycle, tools, busHandlers } = makePi();
+      await bootChild(pi, lifecycle);
+
+      expect(tools.size).toBe(0);
+      for (const channel of RPC_CHANNELS) expect(busHandlers.has(channel)).toBe(false);
+      expect(readyEmits(pi)).toHaveLength(0);
+    });
+
+    it("answers its own query with its own maps, leaving the global registry alone", async () => {
+      // The user agent makes the bare alias collide in the child's branch registry.
+      writeFileSync(join(tmpDir, ".pi", "agents", "reviewer.md"), "---\ndescription: Mine\n---\n\nMine.");
+      const { pi, lifecycle, busHandlers } = makePi();
+      await bootChild(pi, lifecycle);
+
+      const { snapshot, id } = skillSnapshot("simplify", "reviewer");
+      busHandlers.get("skills:changed")!(snapshot);
+      busHandlers.get("skill-agents:query")!({ requestId: "c1" });
+
+      const reply = pi.events.emit.mock.calls.find((c: any[]) => c[0] === "skill-agents:query:reply:c1");
+      expect(reply![1].data.maps[id].reviewer.qualified).toBe("simplify:reviewer");
+      expect(reply![1].data.maps[id].reviewer.collided).toBe(true);
+      // The process-global registry belongs to the root activation alone.
+      expect(getSkillAgents()).toBeUndefined();
+      expect(isValidType("simplify:reviewer")).toBe(false);
+    });
+
+    it("unsubscribes on the child's shutdown", async () => {
+      const { pi, lifecycle, busHandlers } = makePi();
+      await bootChild(pi, lifecycle);
+      expect(busHandlers.has("skills:changed")).toBe(true);
+
+      await lifecycle.get("session_shutdown")();
+
+      expect(busHandlers.has("skills:changed")).toBe(false);
+      expect(busHandlers.has("skill-agents:query")).toBe(false);
+    });
   });
 });

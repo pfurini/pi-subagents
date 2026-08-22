@@ -229,4 +229,89 @@ describe("skill-bundled agents acceptance (WS2)", () => {
     expect(reply.success).toBe(false);
     expect(reply.error).toContain("Unknown or disabled agent type");
   });
+
+  it("republishes the rewrite map when a user agent steals a bare alias mid-session", async () => {
+    const { pi, busHandlers } = await boot();
+    busHandlers.get("skills:changed")!(snapshot(1));
+    expect(lastRewriteMaps(pi).maps[skillId].simplifier.collided).toBe(false);
+    const beforeRevision = lastRewriteMaps(pi).revision;
+
+    // The user takes the name back. Nothing about the SKILL changed, so no
+    // `skills:changed` follows — only the next registry rebuild sees it.
+    writeFileSync(join(tmpDir, ".pi", "agents", "simplifier.md"), "---\ndescription: Mine\n---\n\nMine.");
+    await spawnRpc(busHandlers, "general-purpose", "r1");
+
+    const after = lastRewriteMaps(pi);
+    expect(after.maps[skillId].simplifier.collided).toBe(true);
+    expect(after.revision).toBeGreaterThan(beforeRevision);
+    expect(getAgentConfig("simplifier")?.skillId).toBeUndefined();
+  });
+
+  it("does not republish when a rebuild leaves the alias decisions unchanged", async () => {
+    const { pi, busHandlers } = await boot();
+    busHandlers.get("skills:changed")!(snapshot(1));
+    const emitted = () => pi.events.emit.mock.calls.filter((c: any[]) => c[0] === "skill-agents:rewrite-maps").length;
+    const before = emitted();
+
+    await spawnRpc(busHandlers, "general-purpose", "n1");
+    await spawnRpc(busHandlers, "general-purpose", "n2");
+
+    expect(emitted()).toBe(before);
+  });
+
+  it("drops the agents and empties the map when the skill disappears from the snapshot", async () => {
+    const { pi, busHandlers } = await boot();
+    busHandlers.get("skills:changed")!(snapshot(1));
+    expect(isValidType("simplify:simplifier")).toBe(true);
+
+    busHandlers.get("skills:changed")!({ revision: 2, skills: [], removed: [skillId] });
+
+    expect(isValidType("simplify:simplifier")).toBe(false);
+    expect(getAgentConfig("simplifier")?.skillId).toBeUndefined();
+    expect(lastRewriteMaps(pi).maps).toEqual({});
+  });
+
+  it("keeps a container skill's agents: only the `off` state suppresses them", async () => {
+    // `disable-model-invocation` + `user-invocable: false` is a legitimate
+    // container skill (frozen input 6): not `off`, so its agents stay.
+    const { busHandlers } = await boot();
+    const snap = snapshot(1);
+    snap.skills[0].visibility = { model: "no", user: "no", userInvokeError: false };
+    busHandlers.get("skills:changed")!(snap);
+
+    expect(isValidType("simplify:simplifier")).toBe(true);
+  });
+
+  it("ignores a snapshot whose revision is not a finite number", async () => {
+    const { busHandlers } = await boot();
+    busHandlers.get("skills:changed")!(snapshot(1));
+
+    // Would otherwise pin the watermark and freeze every later snapshot out.
+    busHandlers.get("skills:changed")!({ ...snapshot(Number.POSITIVE_INFINITY), skills: [] });
+    expect(isValidType("simplify:simplifier")).toBe(true);
+
+    busHandlers.get("skills:changed")!(snapshot(2, true));
+    expect(isValidType("simplify:simplifier")).toBe(false);
+  });
+
+  it("stays silent and inert under upstream pi, which has no skill-set seam", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // Nobody answers `skills:query`, and no `skills:changed` ever arrives.
+      const { pi, busHandlers } = await boot();
+      // Spawning drives a registry rebuild, which is the other publish path:
+      // with no skill agents there is nothing to announce, and the contract
+      // already reads absence of the event as the empty map.
+      await spawnRpc(busHandlers, "general-purpose", "u1");
+
+      expect(isValidType("simplify:simplifier")).toBe(false);
+      expect(pi.events.emit.mock.calls.filter((c: any[]) => c[0] === "skill-agents:rewrite-maps")).toEqual([]);
+      expect(warn).not.toHaveBeenCalled();
+      expect(error).not.toHaveBeenCalled();
+    } finally {
+      error.mockRestore();
+      warn.mockRestore();
+    }
+  });
 });

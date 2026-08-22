@@ -10,6 +10,7 @@
  */
 
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
+import type { AgentTerminalStatus } from "./types.js";
 
 /** Minimal event bus interface needed by the RPC handlers. */
 export interface EventBus {
@@ -33,6 +34,17 @@ export const PROTOCOL_VERSION = 3;
 export const AGENT_ENDED_CHANNEL = "subagents:agent-ended";
 
 /**
+ * The `subagents:agent-ended` payload (v3): one terminal event for one agent,
+ * carrying the record's native status verbatim.
+ */
+export interface AgentEndedEvent {
+  agentId: string;
+  status: AgentTerminalStatus;
+  result?: string;
+  error?: string;
+}
+
+/**
  * Ordering gate for `subagents:agent-ended`. The A.9 contract requires an agent's
  * terminal event to be emitted only AFTER its spawn reply. `handleRpc` awaits the
  * spawn handler before emitting the reply, so an immediately-failing run's
@@ -42,7 +54,7 @@ export const AGENT_ENDED_CHANNEL = "subagents:agent-ended";
  */
 export interface AgentEndedGate {
   /** Emit (or buffer, when the agent's spawn reply is still pending) a terminal event. */
-  emit(agentId: string, payload: Record<string, unknown>): void;
+  emit(event: AgentEndedEvent): void;
   /** Mark an RPC-spawned agent's reply as pending (called synchronously at spawn). */
   markSpawnPending(agentId: string): void;
   /** Flush any buffered terminal event once the agent's spawn reply has been emitted. */
@@ -50,27 +62,27 @@ export interface AgentEndedGate {
 }
 
 export function createAgentEndedGate(
-  rawEmit: (payload: Record<string, unknown>) => void,
+  rawEmit: (event: AgentEndedEvent) => void,
 ): AgentEndedGate {
   const pendingReply = new Set<string>();
-  const buffered = new Map<string, Record<string, unknown>>();
+  const buffered = new Map<string, AgentEndedEvent>();
   return {
-    emit(agentId, payload) {
-      if (pendingReply.has(agentId)) {
-        buffered.set(agentId, payload);
+    emit(event) {
+      if (pendingReply.has(event.agentId)) {
+        buffered.set(event.agentId, event);
         return;
       }
-      rawEmit(payload);
+      rawEmit(event);
     },
     markSpawnPending(agentId) {
       pendingReply.add(agentId);
     },
     flushSpawnReply(agentId) {
       if (!pendingReply.delete(agentId)) return;
-      const payload = buffered.get(agentId);
-      if (payload) {
+      const event = buffered.get(agentId);
+      if (event) {
         buffered.delete(agentId);
-        rawEmit(payload);
+        rawEmit(event);
       }
     },
   };

@@ -11,6 +11,14 @@ export type { ThinkingLevel };
 /** Agent type: any string name (built-in defaults or user-defined). */
 export type SubagentType = string;
 
+/**
+ * Separator between a source and an agent in a qualified type (`skill:agent`).
+ * Load-bearing: it is what makes a qualified name unforgeable, so the loader
+ * refuses any agent whose effective type contains it and only minting code may
+ * introduce one.
+ */
+export const QUALIFIED_SEPARATOR = ":";
+
 /** Names of the three embedded default agents. */
 export const DEFAULT_AGENT_NAMES = ["general-purpose", "Explore", "Plan"] as const;
 
@@ -134,6 +142,18 @@ export interface AgentTombstone {
   completedAt: number;
 }
 
+/** Every state an agent record can be in. */
+export type AgentStatus =
+  | "queued" | "running" | "completed" | "steered" | "aborted" | "stopped" | "error";
+
+/**
+ * The settled states. `subagents:agent-ended` carries exactly one of these,
+ * verbatim: core derives `ok = !(error|stopped|aborted)` and drops a payload
+ * whose `status` is absent, so nothing here may be normalized away (notably
+ * `steered`, which the v2 broadcasts fold into "completed").
+ */
+export type AgentTerminalStatus = Exclude<AgentStatus, "queued" | "running">;
+
 /**
  * What `@handle` resolved to: an agent still in memory, or the remains of one
  * whose conversation can be reopened from disk.
@@ -160,7 +180,7 @@ export interface AgentRecord {
    */
   alias?: string;
   description: string;
-  status: "queued" | "running" | "completed" | "steered" | "aborted" | "stopped" | "error";
+  status: AgentStatus;
   result?: string;
   error?: string;
   toolUses: number;

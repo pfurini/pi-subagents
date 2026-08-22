@@ -436,10 +436,9 @@ describe("toolDescriptionMode", () => {
     it("excludes hidden skill agents from the description and the subagent_type roster", () => {
       const tool = setup(undefined, () => setSkillAgents(skillLayer("reviewer"))).get("Agent");
       const visible = `${tool.description}\n${JSON.stringify(tool.parameters)}`;
-      // Neither the qualified name nor the bare alias appears in any visible surface.
       expect(visible).not.toContain("simplify:reviewer");
       expect(visible).not.toContain("- reviewer:");
-      // Sanity: a real default is still listed, so the exclusion isn't hiding everything.
+      // A real default is still listed, so the exclusion isn't hiding everything.
       expect(visible).toContain("general-purpose");
     });
   });

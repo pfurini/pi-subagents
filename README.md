@@ -777,11 +777,12 @@ Recursion skips dotfile directories and `node_modules`. A directory that itself 
 
 A pi skill can ship its own agents in `<skill>/agents/*.md`, parsed exactly like project agents. They are discovered from pi core's A.9 skill-set seam (the `baseDir` of each skill in the `skills:changed` snapshot — which spans CLI `--skill`, settings paths, packages, and nested roots), not from a fixed directory this extension scans.
 
-- **Qualified naming.** Each bundled agent registers under `${skill.listingName}:${agentType}` (e.g. `simplify:reviewer`). The `:` is unforgeable from an agent file (a declared `name:` containing `:` is refused), so a user agent can never collide with a qualified skill agent. Minting from `listingName` (unique per snapshot) rather than `name` keeps two skills that share a bare agent name distinct.
-- **Bare alias.** A bundled agent also claims its bare name (`reviewer`) when that name is free in the non-skill registry AND exactly one skill claims it. Two skills claiming the same free name: neither wins. A user agent added later steals the bare name back; the skill agent keeps its qualified name.
+- **Qualified naming.** Each bundled agent registers under `${skill.listingName}:${agentType}` (e.g. `simplify:reviewer`). The `:` is unforgeable from an agent file — an agent whose effective type contains one is refused, whether it came from `name:` or from the filename — so nothing loaded from disk can collide with, or impersonate, a qualified skill agent. Minting from `listingName` (unique per snapshot) rather than `name` keeps two skills that share a bare agent name distinct.
+- **Bare alias.** A bundled agent also claims its bare name (`reviewer`) when that name is free in the non-skill registry AND exactly one skill claims it. Two skills claiming the same free name: neither wins, and neither does a bundled agent marked `enabled: false`. A user agent added later steals the bare name back; the skill agent keeps its qualified name, and the rewrite map is republished so core follows.
 - **Soft scoping.** Skill agents are hidden from `/agents`, the Agent tool's type list, and `@`-mention autocomplete. They stay spawnable by exact (case-insensitive) qualified or bare name.
 - **Off switch.** There is no per-agent toggle. A skill's bundled agents are suppressed exactly when the skill's resolved visibility is the `off` state (`userInvokeError === true`); disabling the whole skill is the only off switch.
-- **Rewrite maps.** The extension publishes `skill-agents:rewrite-maps` back to core so a skill body referencing a bare agent name is rewritten to the qualified form when (and only when) the bare alias collided.
+- **Rewrite maps.** The extension publishes `skill-agents:rewrite-maps` back to core so a skill body referencing a bare agent name is rewritten to the qualified form when (and only when) the bare alias collided. Every session publishes on its own bus: a subagent session has its own skill runtime, so it runs the seam adapter (and nothing else from this extension) to answer it.
+- **Symlinks.** A skill's `agents/` entries are read as data: symlinked `.md` files are skipped, so a third-party skill cannot point one at a local file and have its contents loaded as an agent prompt. Your own agent directories still follow symlinks.
 - **Degradation.** Under upstream pi with no A.9 seam, the feature is silently inert: zero skill agents, no diagnostics.
 
 ## Tool Denylist
@@ -832,6 +833,7 @@ src/
   cross-extension-rpc.ts # RPC handlers for cross-extension spawn/ping via pi.events; agent-ended gate
   skills-contract.ts  # Byte-for-byte copy of pi core's A.9 skill-set + rewrite-map wire types
   skill-agents.ts     # Skill adapter: snapshot -> registry layer + rewrite-map publisher
+  skill-agents-adapter.ts # Per-session A.9 seam lifecycle (root and child alike)
 
   # Scheduling
   schedule.ts         # SubagentScheduler: cron / +10m / interval / ISO dispatch

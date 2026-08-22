@@ -328,7 +328,7 @@ describe("cross-extension RPC", () => {
     it("emits immediately when the agent has no pending spawn reply", () => {
       const raw = vi.fn();
       const gate = createAgentEndedGate(raw);
-      gate.emit("a1", { agentId: "a1", status: "completed" });
+      gate.emit({ agentId: "a1", status: "completed" });
       expect(raw).toHaveBeenCalledWith({ agentId: "a1", status: "completed" });
     });
 
@@ -336,7 +336,7 @@ describe("cross-extension RPC", () => {
       const raw = vi.fn();
       const gate = createAgentEndedGate(raw);
       gate.markSpawnPending("a1");
-      gate.emit("a1", { agentId: "a1", status: "error" });
+      gate.emit({ agentId: "a1", status: "error" });
       expect(raw).not.toHaveBeenCalled(); // held until the reply
 
       gate.flushSpawnReply("a1");
@@ -355,7 +355,7 @@ describe("cross-extension RPC", () => {
       gate.flushSpawnReply("a1"); // no buffered event yet
       expect(raw).not.toHaveBeenCalled();
 
-      gate.emit("a1", { agentId: "a1", status: "stopped" });
+      gate.emit({ agentId: "a1", status: "stopped" });
       expect(raw).toHaveBeenCalledWith({ agentId: "a1", status: "stopped" });
     });
   });
@@ -367,7 +367,7 @@ describe("cross-extension RPC", () => {
       // Simulate an immediately-failing run: the completion fires as a microtask
       // queued during the (synchronous) spawn, ahead of handleRpc's reply emit.
       (manager.spawn as ReturnType<typeof vi.fn>).mockImplementation(() => {
-        queueMicrotask(() => gate.emit("agent-42", { agentId: "agent-42", status: "error" }));
+        queueMicrotask(() => gate.emit({ agentId: "agent-42", status: "error" }));
         return "agent-42";
       });
       registerRpcHandlers({ ...deps, agentEnded: gate });
