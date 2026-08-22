@@ -1,0 +1,90 @@
+{
+  "removed": [
+    "__SKILL_SET_FIXTURE_ROOT__/removed-skill/SKILL.md"
+  ],
+  "revision": 2,
+  "skills": [
+    {
+      "baseDir": "__SKILL_SET_FIXTURE_ROOT__/full-contract",
+      "frontmatter": {
+        "agent": "general-purpose",
+        "allowed-tools": [
+          "read"
+        ],
+        "argument-hint": "[path]",
+        "arguments": [
+          "path"
+        ],
+        "background": false,
+        "compatibility": "Pi",
+        "context": "inline",
+        "description": "Full contract",
+        "disable-model-invocation": false,
+        "disallowed-tools": "bash",
+        "disallowedTools": [
+          "write"
+        ],
+        "effort": "high",
+        "hooks": {
+          "PreToolUse": "echo ignored"
+        },
+        "license": "MIT",
+        "metadata": {
+          "owner": "core"
+        },
+        "model": "inherit",
+        "name": "full-contract",
+        "paths": [
+          "src/**"
+        ],
+        "shell": "bash",
+        "unknown-list": [
+          "one",
+          "two"
+        ],
+        "unknown-map": {
+          "nested": true
+        },
+        "unknown-scalar": "value",
+        "when_to_use": "Use for contract tests"
+      },
+      "id": "__SKILL_SET_FIXTURE_ROOT__/full-contract/SKILL.md",
+      "listingName": "full-contract",
+      "name": "full-contract",
+      "source": {
+        "baseDir": "__SKILL_SET_FIXTURE_ROOT__/full-contract",
+        "origin": "top-level",
+        "path": "__SKILL_SET_FIXTURE_ROOT__/full-contract/SKILL.md",
+        "scope": "temporary",
+        "source": "local"
+      },
+      "visibility": {
+        "model": "full",
+        "user": "yes",
+        "userInvokeError": false
+      }
+    },
+    {
+      "baseDir": "__SKILL_SET_FIXTURE_ROOT__/minimal-skill",
+      "frontmatter": {
+        "description": "Minimal skill",
+        "disable-model-invocation": false,
+        "name": "minimal-skill"
+      },
+      "id": "__SKILL_SET_FIXTURE_ROOT__/minimal-skill/SKILL.md",
+      "listingName": "minimal-skill",
+      "name": "minimal-skill",
+      "source": {
+        "origin": "package",
+        "path": "__SKILL_SET_FIXTURE_ROOT__/minimal-skill/SKILL.md",
+        "scope": "user",
+        "source": "fixture-package"
+      },
+      "visibility": {
+        "model": "full",
+        "user": "yes",
+        "userInvokeError": false
+      }
+    }
+  ]
+}

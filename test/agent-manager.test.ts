@@ -415,6 +415,30 @@ describe("AgentManager — completion callbacks", () => {
 
     expect(manager.getRecord(id)!.status).toBe("completed");
   });
+
+  it("fires onComplete once with status 'stopped' when a queued agent is aborted", async () => {
+    // A queued record never reaches a settle path; without this the foreground
+    // RPC waiter would hang and no v2/agent-ended broadcast would ever fire.
+    const completions: AgentRecord[] = [];
+    manager = new AgentManager((r) => completions.push(r), 1);
+    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {})); // never settles
+
+    manager.spawn(mockPi, mockCtx, "general-purpose", "running", {
+      description: "running",
+      isBackground: true,
+    });
+    const queuedId = manager.spawn(mockPi, mockCtx, "general-purpose", "queued", {
+      description: "queued",
+      isBackground: true,
+    });
+    expect(manager.getRecord(queuedId)!.status).toBe("queued");
+
+    expect(manager.abort(queuedId)).toBe(true);
+
+    expect(completions).toHaveLength(1);
+    expect(completions[0].id).toBe(queuedId);
+    expect(completions[0].status).toBe("stopped");
+  });
 });
 
 describe("AgentManager — cleanup timer", () => {

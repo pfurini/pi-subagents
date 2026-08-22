@@ -85,9 +85,13 @@ export interface AgentConfig {
   /** false = agent is hidden from the registry */
   enabled?: boolean;
   /** Where this agent was loaded from */
-  source?: "default" | "project" | "global";
+  source?: "default" | "project" | "global" | "skill" | "package";
   /** Path of the .md it was loaded from. Unset for embedded defaults. */
   sourcePath?: string;
+  /** Canonical id of the skill that bundled this agent (skill-sourced agents only). */
+  skillId?: string;
+  /** Soft scoping: hidden from global listings and `@`-mention autocomplete, still spawnable by exact name. */
+  hidden?: boolean;
 }
 
 export type JoinMode = 'async' | 'group' | 'smart';

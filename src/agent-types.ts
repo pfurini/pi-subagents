@@ -54,30 +54,134 @@ export function getFallbackSubagent(): string | undefined { return fallbackSubag
 export function setFallbackSubagent(v: string | undefined): void { fallbackSubagent = v; }
 
 /**
- * Build a registry map: DEFAULT_AGENTS first (unless disabled via settings),
- * then user agents overlaid on top (same name overrides the default).
- * Pure — callers that must not disturb the process-wide registry (nested
- * delegation resolving agents from its own config root) build their own map.
+ * One skill-bundled agent, minted by the skill adapter (`skill-agents.ts`): its
+ * loaded config plus the qualified `skill:agent` name and the bare alias it
+ * would like. The registry build decides whether the bare alias is granted.
  */
-export function buildAgentRegistry(userAgents: Map<string, AgentConfig>): Map<string, AgentConfig> {
+export interface SkillAgentEntry {
+  /** Canonical id (SKILL.md path) of the bundling skill. */
+  skillId: string;
+  /** Unforgeable qualified name, `${listingName}:${agentType}`. */
+  qualified: string;
+  /** The agent's own bare type — the alias candidate. */
+  bareName: string;
+  /** The loaded agent config (source: "skill"). */
+  config: AgentConfig;
+}
+
+/** A session's skill-bundled agents, as an external layer applied over user agents. */
+export type SkillAgentLayer = SkillAgentEntry[];
+
+/**
+ * Per-entry outcome of an alias computation: whether the bare alias was granted.
+ * `!granted` is the rewrite map's `collided`. The publisher diffs these to
+ * decide when to re-emit rewrite maps.
+ */
+export interface SkillAliasDecision {
+  skillId: string;
+  bareName: string;
+  qualified: string;
+  granted: boolean;
+}
+
+/** A built registry plus the alias decisions the skill layer produced. */
+export interface AgentRegistryBuild {
+  registry: Map<string, AgentConfig>;
+  aliases: SkillAliasDecision[];
+}
+
+/** The root session's skill layer, set only by the root activation's adapter. */
+let skillLayer: SkillAgentLayer | undefined;
+
+/** Install the root session's skill-bundled agents (root activation only). */
+export function setSkillAgents(layer: SkillAgentLayer): void { skillLayer = layer; }
+
+/** Drop the root skill layer (root activation shutdown / test teardown). */
+export function clearSkillAgents(): void { skillLayer = undefined; }
+
+/** The current root skill layer — nested tools apply it to their own branch registry. */
+export function getSkillAgents(): SkillAgentLayer | undefined { return skillLayer; }
+
+/** Alias decisions from the most recent `registerAgents`, for the rewrite-map publisher. */
+let lastSkillAliases: SkillAliasDecision[] = [];
+
+/** The skill-alias decisions produced by the last global registry build. */
+export function getSkillAliasDecisions(): SkillAliasDecision[] { return lastSkillAliases; }
+
+/**
+ * Build a registry map: DEFAULT_AGENTS first (unless disabled via settings),
+ * then user agents overlaid on top (same name overrides the default), then the
+ * skill layer applied last but non-competing:
+ *   - qualified names are always added (unforgeable — user files cannot contain ":");
+ *   - a bare alias is added only when its name is absent (case-insensitively)
+ *     from the merged non-skill registry AND claimed by exactly one skill.
+ * Skill entries are marked `hidden` (soft scoping). Pure — the layer is passed
+ * in, never read from module state, so nested/branch registries build from their
+ * own session's snapshot. Returns the map plus the alias decisions.
+ */
+export function buildAgentRegistry(
+  userAgents: Map<string, AgentConfig>,
+  layers?: { skillAgents?: SkillAgentLayer },
+): AgentRegistryBuild {
   const registry = new Map<string, AgentConfig>();
   if (!disableDefaults) {
     for (const [name, config] of DEFAULT_AGENTS) registry.set(name, config);
   }
   for (const [name, config] of userAgents) registry.set(name, config);
-  return registry;
+
+  const layer = layers?.skillAgents ?? [];
+  const aliases: SkillAliasDecision[] = [];
+  if (layer.length === 0) return { registry, aliases };
+
+  // Names already claimed by defaults + user agents (case folded): a bare alias
+  // can never steal one of these.
+  const nonSkillLower = new Set([...registry.keys()].map(k => k.toLowerCase()));
+
+  // Distinct skills claiming each bare name (case folded): a name claimed by
+  // more than one skill goes to neither (frozen inputs 1 + 5).
+  const claimants = new Map<string, Set<string>>();
+  for (const entry of layer) {
+    const lower = entry.bareName.toLowerCase();
+    let set = claimants.get(lower);
+    if (!set) { set = new Set(); claimants.set(lower, set); }
+    set.add(entry.skillId);
+  }
+
+  // Qualified names: always registered (hidden, spawnable by exact name).
+  for (const entry of layer) {
+    registry.set(entry.qualified, skillRegistryConfig(entry, entry.qualified));
+  }
+
+  // Bare aliases: granted only when the name is free and singly-claimed.
+  for (const entry of layer) {
+    const lower = entry.bareName.toLowerCase();
+    const granted = !nonSkillLower.has(lower) && (claimants.get(lower)?.size ?? 0) === 1;
+    if (granted) {
+      registry.set(entry.bareName, skillRegistryConfig(entry, entry.bareName));
+    }
+    aliases.push({ skillId: entry.skillId, bareName: entry.bareName, qualified: entry.qualified, granted });
+  }
+  return { registry, aliases };
+}
+
+/** A skill entry's config as stored under a registry key (qualified or bare alias). */
+function skillRegistryConfig(entry: SkillAgentEntry, name: string): AgentConfig {
+  return { ...entry.config, name, source: "skill", skillId: entry.skillId, hidden: true };
 }
 
 /**
  * Register agents into the unified registry.
- * Starts with DEFAULT_AGENTS, then overlays user agents (overrides defaults with same name).
+ * Starts with DEFAULT_AGENTS, then overlays user agents (overrides defaults with same name),
+ * then the root session's skill layer.
  * Disabled agents (enabled === false) are kept in the registry but excluded from spawning.
  */
 export function registerAgents(userAgents: Map<string, AgentConfig>): void {
   agents.clear();
-  for (const [name, config] of buildAgentRegistry(userAgents)) {
+  const { registry, aliases } = buildAgentRegistry(userAgents, { skillAgents: skillLayer });
+  for (const [name, config] of registry) {
     agents.set(name, config);
   }
+  lastSkillAliases = aliases;
 }
 
 /** Case-insensitive key resolution within a registry. */
@@ -113,10 +217,17 @@ export function isValidTypeIn(registry: Map<string, AgentConfig>, type: string):
   return registry.get(key)?.enabled !== false;
 }
 
-/** Get all enabled type names in a registry (for spawning and tool descriptions). */
+/**
+ * Get all visible, enabled type names in a registry (for spawning lists and tool
+ * descriptions). `hidden` skill-bundled agents are the single soft-scoping choke
+ * point: excluded here, they drop out of the Agent tool type list, the
+ * `subagent_type` description, the `@`-mention roster, the fallback selector, and
+ * nested `availableIn` text — every visible surface — while staying spawnable by
+ * exact name through `resolveSpawnTypeIn` / `isValidTypeIn`, which do not filter.
+ */
 export function getAvailableTypesIn(registry: Map<string, AgentConfig>): string[] {
   return [...registry.entries()]
-    .filter(([_, config]) => config.enabled !== false)
+    .filter(([_, config]) => config.enabled !== false && config.hidden !== true)
     .map(([name]) => name);
 }
 
@@ -238,9 +349,13 @@ export function getAvailableTypes(): string[] {
   return getAvailableTypesIn(agents);
 }
 
-/** Get all type names including disabled (for UI listing). */
+/**
+ * Get all type names including disabled, for the `/agents` UI listing. Excludes
+ * `hidden` skill-bundled agents: they are managed through their skill (pi core's
+ * `/skills`), and with no per-agent toggle `/agents` has no action to offer them.
+ */
 export function getAllTypes(): string[] {
-  return [...agents.keys()];
+  return [...agents.entries()].filter(([_, config]) => config.hidden !== true).map(([name]) => name);
 }
 
 /** Get names of default agents currently in the registry. */

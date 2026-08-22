@@ -1,4 +1,4 @@
-Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it.
+Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it. (Claude Code skills may call this the Task tool.)
 
 Available agent types and the tools they have access to:
 {{typeList}}

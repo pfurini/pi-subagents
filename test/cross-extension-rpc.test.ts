@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { type EventBus, PROTOCOL_VERSION, type RpcDeps, registerRpcHandlers, type SpawnCapable } from "../src/cross-extension-rpc.js";
+import { AGENT_ENDED_CHANNEL, createAgentEndedGate, type EventBus, PROTOCOL_VERSION, type RpcDeps, registerRpcHandlers, type SpawnCapable } from "../src/cross-extension-rpc.js";
 
 /** Simple in-process event bus for testing. */
 function createEventBus(): EventBus {
@@ -39,7 +39,11 @@ describe("cross-extension RPC", () => {
       events.emit("subagents:rpc:ping", { requestId: "req-1" });
 
       await vi.waitFor(() => expect(reply).toHaveBeenCalled());
-      expect(reply).toHaveBeenCalledWith({ success: true, data: { version: PROTOCOL_VERSION } });
+      expect(reply).toHaveBeenCalledWith({
+        success: true,
+        data: { version: PROTOCOL_VERSION, capabilities: { skillAgents: true } },
+      });
+      expect(PROTOCOL_VERSION).toBe(3);
     });
 
     it("scopes replies — other requestIds do not receive it", async () => {
@@ -315,6 +319,81 @@ describe("cross-extension RPC", () => {
       expect(call.success).toBe(false);
       expect(call.error).toMatch(/modelRegistry is unavailable/);
       expect(manager.spawn).not.toHaveBeenCalled();
+    });
+  });
+
+  // --- agent-ended ordering gate (v3) ---
+
+  describe("createAgentEndedGate", () => {
+    it("emits immediately when the agent has no pending spawn reply", () => {
+      const raw = vi.fn();
+      const gate = createAgentEndedGate(raw);
+      gate.emit("a1", { agentId: "a1", status: "completed" });
+      expect(raw).toHaveBeenCalledWith({ agentId: "a1", status: "completed" });
+    });
+
+    it("buffers a terminal event until the spawn reply flushes it, exactly once", () => {
+      const raw = vi.fn();
+      const gate = createAgentEndedGate(raw);
+      gate.markSpawnPending("a1");
+      gate.emit("a1", { agentId: "a1", status: "error" });
+      expect(raw).not.toHaveBeenCalled(); // held until the reply
+
+      gate.flushSpawnReply("a1");
+      expect(raw).toHaveBeenCalledTimes(1);
+      expect(raw).toHaveBeenCalledWith({ agentId: "a1", status: "error" });
+
+      // A second flush must not re-emit.
+      gate.flushSpawnReply("a1");
+      expect(raw).toHaveBeenCalledTimes(1);
+    });
+
+    it("clears pending on flush so a later terminal event emits immediately", () => {
+      const raw = vi.fn();
+      const gate = createAgentEndedGate(raw);
+      gate.markSpawnPending("a1");
+      gate.flushSpawnReply("a1"); // no buffered event yet
+      expect(raw).not.toHaveBeenCalled();
+
+      gate.emit("a1", { agentId: "a1", status: "stopped" });
+      expect(raw).toHaveBeenCalledWith({ agentId: "a1", status: "stopped" });
+    });
+  });
+
+  describe("spawn RPC agent-ended ordering", () => {
+    it("emits a pre-reply completion only after the spawn reply", async () => {
+      const order: string[] = [];
+      const gate = createAgentEndedGate(() => order.push("agent-ended"));
+      // Simulate an immediately-failing run: the completion fires as a microtask
+      // queued during the (synchronous) spawn, ahead of handleRpc's reply emit.
+      (manager.spawn as ReturnType<typeof vi.fn>).mockImplementation(() => {
+        queueMicrotask(() => gate.emit("agent-42", { agentId: "agent-42", status: "error" }));
+        return "agent-42";
+      });
+      registerRpcHandlers({ ...deps, agentEnded: gate });
+
+      events.on("subagents:rpc:spawn:reply:req-o1", () => order.push("spawn-reply"));
+      events.on(AGENT_ENDED_CHANNEL, () => {}); // presence only
+      events.emit("subagents:rpc:spawn", { requestId: "req-o1", type: "general-purpose", prompt: "x" });
+
+      await vi.waitFor(() => expect(order).toContain("agent-ended"));
+      expect(order).toEqual(["spawn-reply", "agent-ended"]);
+    });
+
+    it("marks the spawn pending and flushes on reply", async () => {
+      const gate = {
+        emit: vi.fn(),
+        markSpawnPending: vi.fn(),
+        flushSpawnReply: vi.fn(),
+      };
+      registerRpcHandlers({ ...deps, agentEnded: gate });
+      const reply = vi.fn();
+      events.on("subagents:rpc:spawn:reply:req-o2", reply);
+      events.emit("subagents:rpc:spawn", { requestId: "req-o2", type: "general-purpose", prompt: "x" });
+
+      await vi.waitFor(() => expect(reply).toHaveBeenCalled());
+      expect(gate.markSpawnPending).toHaveBeenCalledWith("agent-42");
+      expect(gate.flushSpawnReply).toHaveBeenCalledWith("agent-42");
     });
   });
 });

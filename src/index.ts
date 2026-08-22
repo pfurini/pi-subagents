@@ -10,6 +10,7 @@
  *   /agents                 — Interactive agent management menu
  */
 
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
@@ -20,9 +21,9 @@ import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, serializeAgentFile } from "./agent-file-toggle.js";
 import { AgentManager } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
-import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
+import { BUILTIN_TOOL_NAMES, clearSkillAgents, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, getSkillAliasDecisions, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent, setSkillAgents } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
-import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
+import { AGENT_ENDED_CHANNEL, createAgentEndedGate, type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { GroupJoinManager } from "./group-join.js";
 import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
@@ -35,6 +36,18 @@ import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, set
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
+import { SkillAgentsController } from "./skill-agents.js";
+import {
+  type RpcReply,
+  SKILL_AGENTS_QUERY_CHANNEL,
+  SKILL_AGENTS_REWRITE_MAPS_CHANNEL,
+  SKILLS_CHANGED_CHANNEL,
+  SKILLS_QUERY_CHANNEL,
+  type SkillAgentRewriteMapsEvent,
+  type SkillSetSnapshot,
+  skillAgentsQueryReplyChannel,
+  skillsQueryReplyChannel,
+} from "./skills-contract.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
@@ -505,6 +518,10 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
+  // v3 `subagents:agent-ended`, gated so an RPC-spawned agent's terminal event
+  // is emitted only after its spawn reply (see createAgentEndedGate).
+  const agentEndedGate = createAgentEndedGate((payload) => pi.events.emit(AGENT_ENDED_CHANNEL, payload));
+
   // Background completion: route through group join or send individual nudge
   const manager = new AgentManager((record) => {
     // Nested children report only through their owning parent's scoped tools.
@@ -519,6 +536,15 @@ export default function (pi: ExtensionAPI) {
     } else {
       pi.events.emit("subagents:completed", eventData);
     }
+    // v3: a terminal event for every transition, carrying the record's native
+    // status verbatim (completed | steered | error | aborted | stopped). Core
+    // derives ok = !(error|stopped|aborted); no status-normalizing here.
+    agentEndedGate.emit(record.id, {
+      agentId: record.id,
+      status: record.status,
+      ...(record.result !== undefined && { result: record.result }),
+      ...(record.error !== undefined && { error: record.error }),
+    });
 
     // Persist final record for cross-extension history reconstruction
     pi.appendEntry("subagents:record", {
@@ -714,6 +740,94 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  // ---- A.9 skill-bundled agents adapter (root activation) ----
+  // This extension does not run in child subagent sessions (inChildSessionContext
+  // early-return at the top of the factory), so the adapter is wired once, on the
+  // root's session bus. It consumes core's `skills:changed`/`skills:query` seam
+  // and publishes/answers the `skill-agents:*` rewrite-map seam. Nested subagent
+  // branches still see skill agents through NestedToolContext (frozen input 3),
+  // fed from the root layer via getSkillAgents().
+  const skillAgentsController = new SkillAgentsController();
+  const skillAgentsUnsubs: Array<() => void> = [];
+  let skillAgentsWired = false;
+
+  function isSkillSetSnapshot(data: unknown): data is SkillSetSnapshot {
+    if (typeof data !== "object" || data === null) return false;
+    const snap = data as Partial<SkillSetSnapshot>;
+    return typeof snap.revision === "number" && Array.isArray(snap.skills) && Array.isArray(snap.removed);
+  }
+
+  function publishSkillRewriteMaps(): void {
+    // Root view: alias decisions from the global registry, refreshed by the
+    // reloadCustomAgents in applySkillSnapshot. Publish only when they changed.
+    skillAgentsController.publish(getSkillAliasDecisions(), (event) =>
+      pi.events.emit(SKILL_AGENTS_REWRITE_MAPS_CHANNEL, event));
+  }
+
+  function applySkillSnapshot(snapshot: SkillSetSnapshot): void {
+    const layer = skillAgentsController.ingest(snapshot);
+    if (!layer) return; // stale revision — ignore
+    if (ownsManagerRegistry) {
+      setSkillAgents(layer);
+      reloadCustomAgents();  // rebuild the global registry with the new layer
+      registerAgentTool();   // refresh the Agent tool's roster/description (S3)
+    }
+    publishSkillRewriteMaps();
+  }
+
+  // One-shot pull so an activation that binds after core's initial publication
+  // still gets the snapshot (core re-emits on changes, so a lost pull self-heals).
+  function querySkillSet(): void {
+    const requestId = randomUUID();
+    const replyChannel = skillsQueryReplyChannel(requestId);
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const unsub = pi.events.on(replyChannel, (data: unknown) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      unsub();
+      if (data && typeof data === "object" && (data as { success?: unknown }).success === true) {
+        const snap = (data as { data?: unknown }).data;
+        if (isSkillSetSnapshot(snap)) applySkillSnapshot(snap);
+      }
+    });
+    timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      unsub();
+    }, 2000);
+    timer.unref?.();
+    pi.events.emit(SKILLS_QUERY_CHANNEL, { requestId });
+  }
+
+  function wireSkillAgents(): void {
+    if (skillAgentsWired) return;
+    skillAgentsWired = true;
+    skillAgentsUnsubs.push(
+      pi.events.on(SKILLS_CHANGED_CHANNEL, (data: unknown) => {
+        if (isSkillSetSnapshot(data)) applySkillSnapshot(data);
+      }),
+    );
+    // Answer rewrite-map pulls (core's SkillRuntime pulls on construction).
+    skillAgentsUnsubs.push(
+      pi.events.on(SKILL_AGENTS_QUERY_CHANNEL, (data: unknown) => {
+        const requestId = (data as { requestId?: unknown })?.requestId;
+        if (typeof requestId !== "string" || requestId.length === 0) return;
+        const reply: RpcReply<SkillAgentRewriteMapsEvent> = { success: true, data: skillAgentsController.current() };
+        pi.events.emit(skillAgentsQueryReplyChannel(requestId), reply);
+      }),
+    );
+    querySkillSet();
+  }
+
+  function unwireSkillAgents(): void {
+    for (const unsub of skillAgentsUnsubs.splice(0)) unsub();
+    skillAgentsWired = false;
+    if (ownsManagerRegistry) clearSkillAgents();
+  }
+
+
   // Capture ctx from session_start for RPC spawn handler + start the scheduler.
   // This also wires the RPC handlers and broadcasts readiness — on the first
   // bound session_start, so a filtered-out activation never advertises (#142).
@@ -738,11 +852,16 @@ export default function (pi: ExtensionAPI) {
             return !record?.parentAgentId && manager.abort(id);
           },
         },
+        agentEnded: agentEndedGate,
       });
+      // Wire the A.9 skill-agents adapter on this same first bound session_start,
+      // against this session's bus, before advertising readiness.
+      wireSkillAgents();
       // Broadcast readiness so extensions loaded alongside us can discover us.
       // Emitting after all factories have run (rather than at factory time)
       // also avoids the race where a consumer loaded after us misses the event.
-      pi.events.emit("subagents:ready", {});
+      // Payload widened from {} to {sessionId} (additive — core reads no fields).
+      pi.events.emit("subagents:ready", { sessionId: ctx.sessionManager?.getSessionId?.() });
     }
     if (isSchedulingEnabled() && !scheduler.isActive()) startScheduler(ctx);
     // Stack `@handle` suggestions on pi's built-in autocomplete. Registered at
@@ -1002,6 +1121,9 @@ export default function (pi: ExtensionAPI) {
     rpcHandle?.unsubStop();
     rpcHandle?.unsubPing();
     rpcHandle = undefined;
+    // Unsubscribe the A.9 adapter and (root) drop the skill layer — no terminal
+    // re-publish; a fresh activation re-pulls the snapshot.
+    unwireSkillAgents();
     currentCtx = undefined;
     // Only release the global slot if this activation claimed it — a child
     // session's shutdown must not delete the root session's registry entry.
@@ -1343,7 +1465,9 @@ export default function (pi: ExtensionAPI) {
   // Compact Agent tool description (#91, `toolDescriptionMode: "compact"`) —
   // the same load-bearing facts as the full version at ~75% fewer tokens, for
   // small/local models. Per-option details live in the param descriptions.
-  const compactAgentToolDescription = `Launch an autonomous agent for complex, multi-step tasks. Agent types:
+  // A builder, not a const: skill/package layer changes refresh the tool, and
+  // `{{typeList}}` templates plus future package agents need the live roster.
+  const buildCompactAgentToolDescription = () => `Launch an autonomous agent for complex, multi-step tasks. (Claude Code skills may call this the Task tool.) Agent types:
 ${buildCompactTypeListText()}
 
 Custom agents: .pi/agents/<name>.md (project) or ${getAgentDir()}/agents/<name>.md (global).
@@ -1355,7 +1479,7 @@ Notes:
 - The result is not shown to the user — summarize it for them. Verify an agent's claimed code changes before reporting work done.
 - resume continues a previous agent by ID; steer_subagent messages a running one.${isolationCompactGuideline}`;
 
-  const fullAgentToolDescription = `Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it.
+  const buildFullAgentToolDescription = () => `Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it. (Claude Code skills may call this the Task tool.)
 
 Available agent types and the tools they have access to:
 ${buildTypeListText()}
@@ -1435,24 +1559,25 @@ Terse command-style prompts produce shallow, generic work.
     return undefined;
   };
 
-  const agentToolDescription = (() => {
+  const computeAgentToolDescription = (): string => {
     const mode = getToolDescriptionMode();
-    if (mode === "compact") return compactAgentToolDescription;
+    if (mode === "compact") return buildCompactAgentToolDescription();
     if (mode === "custom") {
       const custom = loadCustomToolDescription();
       if (custom) return custom;
       console.warn('[pi-subagents] toolDescriptionMode is "custom" but no agent-tool-description.md found — using "full"');
     }
-    return fullAgentToolDescription;
-  })();
+    return buildFullAgentToolDescription();
+  };
 
-  // Held rather than registered inline: the mention clone reuses this exact
-  // definition, so the agent it starts is an ordinary top-level spawn instead
-  // of a second implementation that has to be kept in step with this one.
-  const agentTool = defineTool({
+  // A builder, not a value: `registerAgentTool()` rebuilds it whenever the skill
+  // layer changes so the description and `subagent_type` roster stay current. The
+  // mention clone reuses the registered object, so its spawn is an ordinary
+  // top-level one rather than a second implementation to keep in step.
+  const buildAgentTool = () => defineTool({
     name: SUBAGENT_TOOL_NAMES.AGENT,
     label: "Agent",
-    description: agentToolDescription,
+    description: computeAgentToolDescription(),
     promptSnippet: "Launch autonomous sub-agents for complex multi-step tasks",
     promptGuidelines: [
       "Use Agent with specialized agents when the task matches an agent type's description. Subagents are valuable for parallelizing independent queries or for protecting the main context window from excessive results, but should not be used excessively when not needed. Importantly, avoid duplicating work that subagents are already doing — if you delegate research to a subagent, do not also perform the same searches yourself.",
@@ -2094,10 +2219,22 @@ Terse command-style prompts produce shallow, generic work.
     pi.registerTool(withUsageReporting(tool));
   }
 
-  // The mention path is handed THIS object, not the bare `agentTool` — see the
-  // mention-clone header on why the clone must call the registered tool.
-  const registeredAgentTool = withUsageReporting(agentTool);
-  pi.registerTool(registeredAgentTool);
+  // The mention path is handed THIS object, not a bare tool — see the
+  // mention-clone header on why the clone must call the registered tool. It is a
+  // mutable ref so a refresh (registerAgentTool) swaps in the new object, which
+  // the `input` handler reads at call time; re-registration replaces by name.
+  let registeredAgentTool: ReturnType<typeof buildAgentTool>;
+
+  /**
+   * Build and (re)register the Agent tool. Called once at init and again when the
+   * skill layer changes (S4), so the description, `subagent_type` roster, and
+   * custom-template expansion track the live registry. Idempotent per name.
+   */
+  function registerAgentTool(): void {
+    registeredAgentTool = withUsageReporting(buildAgentTool());
+    pi.registerTool(registeredAgentTool);
+  }
+  registerAgentTool();
 
   // ---- get_subagent_result tool ----
 

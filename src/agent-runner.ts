@@ -17,7 +17,7 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getReadOnlyMemoryToolNames, getToolNamesForType } from "./agent-types.js";
+import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getReadOnlyMemoryToolNames, getSkillAgents, getToolNamesForType } from "./agent-types.js";
 import { runInChildSessionContext } from "./child-context.js";
 import { buildParentContext, extractText } from "./context.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
@@ -823,6 +823,9 @@ export async function runAgent(
         maxSubagentDepth: effectiveMaxDepth,
         allowedSubagents: agentConfig.allowedSubagents,
         configCwd,
+        // The root's skill layer, so nested "all" delegation can spawn skill
+        // agents from this branch's registry (frozen input 3).
+        skillAgents: getSkillAgents(),
       })
     : [];
   const nestedToolNames = new Set(nestedTools.map(tool => tool.name));

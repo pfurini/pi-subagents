@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { clearSkillAgents, setSkillAgents } from "../src/agent-types.js";
 import subagentsExtension from "../src/index.js";
 import { setWorktreeIsolationEnabled } from "../src/worktree.js";
 
@@ -80,6 +81,7 @@ describe("toolDescriptionMode", () => {
     // previous test left it. Reset it so each setup()'s settings decide, and
     // so the "default" assertions below really test the default.
     setWorktreeIsolationEnabled(true);
+    clearSkillAgents();
     process.chdir(prevCwd);
     if (prevAgentDir == null) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
@@ -406,6 +408,39 @@ describe("toolDescriptionMode", () => {
       const tools = withAgent("narrow", "tools: read, grep");
       const desc: string = tools.get("Agent").description;
       expect(desc).toContain("- narrow: narrow agent. (Tools: read, grep)");
+    });
+  });
+
+  describe("skill-bundled agents in the Agent tool (S3)", () => {
+    const skillLayer = (bareName: string) => [{
+      skillId: "/skills/simplify/SKILL.md",
+      qualified: `simplify:${bareName}`,
+      bareName,
+      config: {
+        name: bareName,
+        description: "A skill-bundled reviewer",
+        extensions: false as const,
+        skills: false as const,
+        systemPrompt: "Review.",
+        promptMode: "replace" as const,
+      },
+    }];
+
+    it("adds the Claude Code Task-tool parenthetical to the full and compact descriptions", () => {
+      const full = setup().get("Agent").description as string;
+      expect(full).toContain("(Claude Code skills may call this the Task tool.)");
+      const compact = setup({ toolDescriptionMode: "compact" }).get("Agent").description as string;
+      expect(compact).toContain("(Claude Code skills may call this the Task tool.)");
+    });
+
+    it("excludes hidden skill agents from the description and the subagent_type roster", () => {
+      const tool = setup(undefined, () => setSkillAgents(skillLayer("reviewer"))).get("Agent");
+      const visible = `${tool.description}\n${JSON.stringify(tool.parameters)}`;
+      // Neither the qualified name nor the bare alias appears in any visible surface.
+      expect(visible).not.toContain("simplify:reviewer");
+      expect(visible).not.toContain("- reviewer:");
+      // Sanity: a real default is still listed, so the exclusion isn't hiding everything.
+      expect(visible).toContain("general-purpose");
     });
   });
 });

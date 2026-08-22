@@ -14,6 +14,7 @@ import {
   getAvailableTypesIn,
   resolveEnabledTypeIn,
   resolveTypeIn,
+  type SkillAgentLayer,
 } from "./agent-types.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { isolationParam, resolveAgentInvocationConfig } from "./invocation-config.js";
@@ -100,6 +101,12 @@ export interface NestedToolContext {
   allowedSubagents: "all" | string[];
   /** Root used for agent/config discovery; may differ from the agent's working directory. */
   configCwd: string;
+  /**
+   * This session's skill-bundled agents (frozen input 3: nested "all" delegation
+   * sees skill agents). Applied to the per-branch registry so a worktree/child
+   * builds from its own session's snapshot, never the root's.
+   */
+  skillAgents?: SkillAgentLayer;
 }
 
 function textResult(text: string, isError = false) {
@@ -145,7 +152,10 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
   // Agents resolve from a registry built for THIS branch's config root (under
   // worktree isolation, the copy). Never via registerAgents — that is
   // process-global state shared with the main session and every other agent.
-  const loadRegistry = () => buildAgentRegistry(loadCustomAgents(context.configCwd));
+  // This session's own skill layer is applied so nested "all" delegation sees
+  // skill agents; a nested rebuild never publishes rewrite maps (aliases dropped).
+  const loadRegistry = () =>
+    buildAgentRegistry(loadCustomAgents(context.configCwd), { skillAgents: context.skillAgents }).registry;
   const allowedTypesIn = (registry: Map<string, AgentConfig>): Set<string> | undefined =>
     context.allowedSubagents === "all"
       ? undefined

@@ -29,10 +29,11 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 - **Persistent agent memory** — three scopes (project, local, user) with automatic read-only fallback for agents without write tools
 - **Git worktree isolation** — run agents in isolated repo copies; changes auto-committed to branches on completion
 - **Skill preloading** — inject named skills into agent system prompts, discovered from `.pi/skills/`, `.agents/skills/`, and global locations (Pi-standard `<name>/SKILL.md` directory layout supported)
+- **[Skill-bundled agents](#skill-bundled-agents)** — a pi skill can ship agents in `<skill>/agents/*.md`; they register under qualified `skill:agent` names (plus a bare alias when it's free), stay soft-scoped out of listings, and are gated by the skill's own visibility. Discovered from pi core's A.9 skill-set seam; inert under upstream pi
 - **Tool denylist** — block specific tools via `disallowed_tools` frontmatter
 - **Styled completion notifications** — background agent results render as themed, compact notification boxes (icon, stats, result preview) instead of raw XML. Expandable to show full output. Group completions render each agent individually
 - **Event bus** — lifecycle events (`subagents:created`, `started`, `completed`, `failed`, `steered`, `compacted`) emitted via `pi.events`, enabling other extensions to react to sub-agent activity
-- **Cross-extension RPC** — other pi extensions can spawn and stop subagents via the `pi.events` event bus (`subagents:rpc:ping`, `subagents:rpc:spawn`, `subagents:rpc:stop`). Standardized reply envelopes with protocol versioning. Emits `subagents:ready` on session start
+- **Cross-extension RPC** — other pi extensions can spawn and stop subagents via the `pi.events` event bus (`subagents:rpc:ping`, `subagents:rpc:spawn`, `subagents:rpc:stop`). Standardized reply envelopes with protocol versioning (v3 advertises `capabilities.skillAgents` and emits `subagents:agent-ended` per terminal transition). Emits `subagents:ready` on session start
 - **Schedule subagents** — pass `schedule` to the `Agent` tool to fire on cron / interval / one-shot. Session-scoped jobs with PID-locked persistence; results land via the same `subagent-notification` followUp path as manual background completions; manage via `/agents → Scheduled jobs`
 - **Model scope enforcement** — opt-in validation that subagent model choices stay within your pi `enabledModels` allowlist (sourced from `/scoped-models`, with both global and project-local pi settings honored). Caller-supplied out-of-scope → hard error to orchestrator; frontmatter-pinned out-of-scope → warning + runs anyway (frontmatter authoritative). Toggle via `/agents → Settings → Scope models`
 
@@ -596,11 +597,16 @@ Agent lifecycle events are emitted via `pi.events.emit()` so other extensions ca
 | `subagents:started` | Agent transitions to running (including queued→running) | `id`, `type`, `description` |
 | `subagents:completed` | Agent finished successfully (background and foreground) | `id`, `type`, `durationMs`, `tokens` (display total, `{ input, output, total }` — see the note below), `usage` (the run's spend as a pi `Usage`: token components including `cacheRead`, plus `cost.total` in USD; absent when nothing was spent), `toolUses`, `result` |
 | `subagents:failed` | Agent errored, stopped, or aborted (background and foreground) | same as completed + `error`, `status` |
+| `subagents:agent-ended` | Every terminal transition (v3, alongside the completed/failed broadcasts) | `agentId`, `status` (native terminal status: `completed` \| `steered` \| `error` \| `aborted` \| `stopped`), `result?`, `error?` — emitted only after the agent's spawn reply |
 | `subagents:steered` | Steering message sent | `id`, `message` |
 | `subagents:compacted` | Agent's session successfully compacted | `id`, `type`, `description`, `reason` (`"manual"` / `"threshold"` / `"overflow"`), `tokensBefore`, `compactionCount` |
 | `subagents:scheduled` | Schedule lifecycle change | `{ type: "added" \| "removed" \| "updated" \| "fired" \| "error", … }` (job/agentId/error fields per type) |
 | `subagents:scheduler_ready` | Scheduler bound to session, enabled jobs armed | `sessionId`, `jobCount` |
-| `subagents:ready` | RPC handlers registered and armed — fired on session start; not emitted in a session that excludes pi-subagents | — |
+| `subagents:ready` | RPC handlers registered and armed — fired on session start; not emitted in a session that excludes pi-subagents | `sessionId` |
+| `skills:changed` *(consumed)* | pi core's A.9 skill-set snapshot (load, `/reload`, watch, visibility change) | the full `SkillSetSnapshot`; drives skill-agent registration |
+| `skills:query` *(emitted)* | one-shot pull on activation so a late bind still gets the snapshot | `requestId`; core replies on `skills:query:reply:<requestId>` |
+| `skill-agents:rewrite-maps` *(emitted)* | rewrite maps re-published on every registry change (deduped) | `revision`, `maps` (`{ [skillId]: { [bareName]: { qualified, collided } } }`) |
+| `skill-agents:query` *(answered)* | core's SkillRuntime pulls the current maps | `requestId`; answered on `skill-agents:query:reply:<requestId>` |
 | `subagents:settings_loaded` | Persisted settings applied at extension init | `settings` (merged global + project) |
 | `subagents:settings_changed` | `/agents` → Settings mutation was applied | `settings`, `persisted` (`boolean` — `false` on write failure) |
 
@@ -638,6 +644,8 @@ const unsub = pi.events.on(`subagents:rpc:ping:reply:${requestId}`, (reply) => {
 });
 pi.events.emit("subagents:rpc:ping", { requestId });
 ```
+
+The ping reply carries `{ version, capabilities }`. As of `PROTOCOL_VERSION` 3 the version is `3` and `capabilities.skillAgents` is `true`; pi core forwards a qualified `skill:agent` spawn type only after a ping advertising `{ version: >= 3, capabilities: { skillAgents: true } }`, otherwise it degrades that spawn to `general-purpose`.
 
 ### Spawn
 
@@ -765,6 +773,17 @@ Recursion skips dotfile directories and `node_modules`. A directory that itself 
 
 **Security:** symlinks are rejected at every layer (root, flat file, skill directory, `SKILL.md` inside a skill directory) — intentional deviation from Pi, which follows symlinks. Skill names with path-traversal characters (`..`, `/`, `\`, spaces, leading dot, >128 chars) are rejected.
 
+## Skill-bundled agents
+
+A pi skill can ship its own agents in `<skill>/agents/*.md`, parsed exactly like project agents. They are discovered from pi core's A.9 skill-set seam (the `baseDir` of each skill in the `skills:changed` snapshot — which spans CLI `--skill`, settings paths, packages, and nested roots), not from a fixed directory this extension scans.
+
+- **Qualified naming.** Each bundled agent registers under `${skill.listingName}:${agentType}` (e.g. `simplify:reviewer`). The `:` is unforgeable from an agent file (a declared `name:` containing `:` is refused), so a user agent can never collide with a qualified skill agent. Minting from `listingName` (unique per snapshot) rather than `name` keeps two skills that share a bare agent name distinct.
+- **Bare alias.** A bundled agent also claims its bare name (`reviewer`) when that name is free in the non-skill registry AND exactly one skill claims it. Two skills claiming the same free name: neither wins. A user agent added later steals the bare name back; the skill agent keeps its qualified name.
+- **Soft scoping.** Skill agents are hidden from `/agents`, the Agent tool's type list, and `@`-mention autocomplete. They stay spawnable by exact (case-insensitive) qualified or bare name.
+- **Off switch.** There is no per-agent toggle. A skill's bundled agents are suppressed exactly when the skill's resolved visibility is the `off` state (`userInvokeError === true`); disabling the whole skill is the only off switch.
+- **Rewrite maps.** The extension publishes `skill-agents:rewrite-maps` back to core so a skill body referencing a bare agent name is rewritten to the qualified form when (and only when) the bare alias collided.
+- **Degradation.** Under upstream pi with no A.9 seam, the feature is silently inert: zero skill agents, no diagnostics.
+
 ## Tool Denylist
 
 Block specific tools from an agent even if extensions provide them:
@@ -788,7 +807,8 @@ src/
   # Agent registry
   default-agents.ts   # Embedded default agent configs (general-purpose, Explore, Plan)
   custom-agents.ts    # Load user-defined agents from .pi/agents/, .agents/agents/, and global agents
-  agent-types.ts      # Unified agent registry (defaults + user), tool name resolution
+  agent-dir-loader.ts # Shared loader: one directory of *.md agent files -> AgentConfig map
+  agent-types.ts      # Unified agent registry (defaults + user + skill layer), tool name resolution
   agent-file-toggle.ts # Locate/edit an agent's .md: enabled: toggle, eject to frontmatter
   agent-color.ts      # Claude Code/Agency Agents name color parsing and badge rendering
 
@@ -809,7 +829,9 @@ src/
   model-scope.ts      # scopeModels allowlist policy, shared by top-level and nested tools
   mention.ts          # `@handle message` grammar: suggestion triggers and send parsing
   mention-clone.ts    # Run a mention's turn in a cloned conversation, off the main chat
-  cross-extension-rpc.ts # RPC handlers for cross-extension spawn/ping via pi.events
+  cross-extension-rpc.ts # RPC handlers for cross-extension spawn/ping via pi.events; agent-ended gate
+  skills-contract.ts  # Byte-for-byte copy of pi core's A.9 skill-set + rewrite-map wire types
+  skill-agents.ts     # Skill adapter: snapshot -> registry layer + rewrite-map publisher
 
   # Scheduling
   schedule.ts         # SubagentScheduler: cron / +10m / interval / ISO dispatch

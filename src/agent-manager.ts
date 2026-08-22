@@ -943,6 +943,10 @@ export class AgentManager {
       this.queue = this.queue.filter(q => q.id !== id);
       record.status = "stopped";
       record.completedAt = Date.now();
+      // A queued record never reaches a settle path, so route its cancellation
+      // through the same terminal notification as any other stop — otherwise no
+      // completion fires at all and a foreground RPC waiter hangs to its cap.
+      try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
       return true;
     }
 

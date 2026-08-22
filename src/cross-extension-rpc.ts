@@ -22,8 +22,59 @@ export type RpcReply<T = void> =
   | { success: true; data?: T }
   | { success: false; error: string };
 
-/** RPC protocol version — bumped when the envelope or method contracts change. */
-export const PROTOCOL_VERSION = 2;
+/**
+ * RPC protocol version — bumped when the envelope or method contracts change.
+ * v3 advertises `capabilities.skillAgents` on ping, emits `subagents:agent-ended`
+ * for every terminal transition, and answers the skill-agents rewrite-map seam.
+ */
+export const PROTOCOL_VERSION = 3;
+
+/** Broadcast channel carrying a terminal event for one agent (v3). */
+export const AGENT_ENDED_CHANNEL = "subagents:agent-ended";
+
+/**
+ * Ordering gate for `subagents:agent-ended`. The A.9 contract requires an agent's
+ * terminal event to be emitted only AFTER its spawn reply. `handleRpc` awaits the
+ * spawn handler before emitting the reply, so an immediately-failing run's
+ * completion can be queued as a microtask ahead of the reply — this gate buffers
+ * such an event until the spawn reply flushes it. Agent-tool spawns have no RPC
+ * reply to wait for (never marked pending), so their terminal event emits at once.
+ */
+export interface AgentEndedGate {
+  /** Emit (or buffer, when the agent's spawn reply is still pending) a terminal event. */
+  emit(agentId: string, payload: Record<string, unknown>): void;
+  /** Mark an RPC-spawned agent's reply as pending (called synchronously at spawn). */
+  markSpawnPending(agentId: string): void;
+  /** Flush any buffered terminal event once the agent's spawn reply has been emitted. */
+  flushSpawnReply(agentId: string): void;
+}
+
+export function createAgentEndedGate(
+  rawEmit: (payload: Record<string, unknown>) => void,
+): AgentEndedGate {
+  const pendingReply = new Set<string>();
+  const buffered = new Map<string, Record<string, unknown>>();
+  return {
+    emit(agentId, payload) {
+      if (pendingReply.has(agentId)) {
+        buffered.set(agentId, payload);
+        return;
+      }
+      rawEmit(payload);
+    },
+    markSpawnPending(agentId) {
+      pendingReply.add(agentId);
+    },
+    flushSpawnReply(agentId) {
+      if (!pendingReply.delete(agentId)) return;
+      const payload = buffered.get(agentId);
+      if (payload) {
+        buffered.delete(agentId);
+        rawEmit(payload);
+      }
+    },
+  };
+}
 
 /** Minimal AgentManager interface needed by the spawn/stop RPCs. */
 export interface SpawnCapable {
@@ -36,6 +87,8 @@ export interface RpcDeps {
   pi: unknown;                    // passed through to manager.spawn
   getCtx: () => unknown | undefined;  // returns current ExtensionContext
   manager: SpawnCapable;
+  /** Ordering gate so an RPC-spawned agent's `agent-ended` waits for its spawn reply. */
+  agentEnded?: Pick<AgentEndedGate, "markSpawnPending" | "flushSpawnReply">;
 }
 
 export interface RpcHandle {
@@ -52,6 +105,7 @@ function handleRpc<P extends { requestId: string }>(
   events: EventBus,
   channel: string,
   fn: (params: P) => unknown | Promise<unknown>,
+  onReplied?: (params: P, data: unknown) => void,
 ): () => void {
   return events.on(channel, async (raw: unknown) => {
     const params = raw as P;
@@ -60,6 +114,7 @@ function handleRpc<P extends { requestId: string }>(
       const reply: { success: true; data?: unknown } = { success: true };
       if (data !== undefined) reply.data = data;
       events.emit(`${channel}:reply:${params.requestId}`, reply);
+      onReplied?.(params, data);
     } catch (err: any) {
       events.emit(`${channel}:reply:${params.requestId}`, {
         success: false, error: err?.message ?? String(err),
@@ -73,10 +128,10 @@ function handleRpc<P extends { requestId: string }>(
  * Returns unsub functions for cleanup.
  */
 export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
-  const { events, pi, getCtx, manager } = deps;
+  const { events, pi, getCtx, manager, agentEnded } = deps;
 
   const unsubPing = handleRpc(events, "subagents:rpc:ping", () => {
-    return { version: PROTOCOL_VERSION };
+    return { version: PROTOCOL_VERSION, capabilities: { skillAgents: true } };
   });
 
   const unsubSpawn = handleRpc<{ requestId: string; type: string; prompt: string; options?: any }>(
@@ -108,7 +163,15 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
         normalizedOptions = { ...normalizedOptions, model: resolved };
       }
 
-      return { id: manager.spawn(pi, ctx, type, prompt, normalizedOptions) };
+      const id = manager.spawn(pi, ctx, type, prompt, normalizedOptions);
+      // Mark synchronously (before handleRpc's await yields) so an
+      // immediately-failing run's `agent-ended` buffers until the reply.
+      agentEnded?.markSpawnPending(id);
+      return { id };
+    },
+    (_params, data) => {
+      const id = (data as { id?: string } | undefined)?.id;
+      if (id) agentEnded?.flushSpawnReply(id);
     },
   );
 

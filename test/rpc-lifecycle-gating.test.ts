@@ -26,6 +26,7 @@ vi.mock("../src/agent-runner.js", async () => {
 });
 
 import { runAgent } from "../src/agent-runner.js";
+import { clearSkillAgents, getSkillAgents, isValidType } from "../src/agent-types.js";
 import subagentsExtension from "../src/index.js";
 
 const RPC_CHANNELS = ["subagents:rpc:ping", "subagents:rpc:spawn", "subagents:rpc:stop"] as const;
@@ -230,5 +231,161 @@ describe("issue #142: RPC handlers + subagents:ready are gated on session_start"
     for (const channel of RPC_CHANNELS) {
       expect(onCallsFor(pi, channel), `${channel} registered exactly once`).toHaveLength(1);
     }
+  });
+});
+
+describe("A.9 skill-agents adapter lifecycle (S4)", () => {
+  let tmpDir: string;
+  let agentDir: string;
+  let prevCwd: string;
+  let prevAgentDir: string | undefined;
+  let prevHome: string | undefined;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "pi-s4-"));
+    agentDir = mkdtempSync(join(tmpdir(), "pi-s4-agentdir-"));
+    prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+    prevHome = process.env.HOME;
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    process.env.HOME = agentDir;
+    prevCwd = process.cwd();
+    mkdirSync(join(tmpDir, ".pi"), { recursive: true });
+    writeFileSync(join(tmpDir, ".pi", "subagents.json"), JSON.stringify({ schedulingEnabled: false }));
+    process.chdir(tmpDir);
+    // Free the process-global manager slot so this extension instance is the
+    // root owner (an earlier test's factory may have claimed and not released it).
+    delete (globalThis as any)[Symbol.for("pi-subagents:manager")];
+  });
+
+  afterEach(() => {
+    clearSkillAgents();
+    process.chdir(prevCwd);
+    if (prevAgentDir == null) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+    if (prevHome == null) delete process.env.HOME;
+    else process.env.HOME = prevHome;
+    rmSync(tmpDir, { recursive: true, force: true });
+    rmSync(agentDir, { recursive: true, force: true });
+    delete (globalThis as any)[Symbol.for("pi-subagents:manager")];
+    vi.restoreAllMocks();
+  });
+
+  function skillSnapshot(listingName: string, agentName: string, revision = 1) {
+    const baseDir = join(tmpDir, listingName.replace(/[:/]/g, "_"));
+    const agentsDir = join(baseDir, "agents");
+    mkdirSync(agentsDir, { recursive: true });
+    writeFileSync(join(agentsDir, `${agentName}.md`), "---\ndescription: bundled\n---\n\nBody.");
+    const id = join(baseDir, "SKILL.md");
+    return {
+      snapshot: {
+        revision,
+        removed: [],
+        skills: [{
+          id,
+          name: listingName,
+          listingName,
+          baseDir,
+          source: { path: id, source: "local", scope: "project", origin: "top-level" },
+          frontmatter: {},
+          visibility: { model: "full", user: "yes", userInvokeError: false },
+        }],
+      },
+      id,
+    };
+  }
+
+  const emitsOn = (pi: any, channel: string) =>
+    pi.events.emit.mock.calls.filter((c: any[]) => c[0] === channel);
+
+  it("wires no A.9 listeners at factory time", () => {
+    const { pi, busHandlers } = makePi();
+    subagentsExtension(pi);
+    expect(busHandlers.has("skills:changed")).toBe(false);
+    expect(busHandlers.has("skill-agents:query")).toBe(false);
+    expect(emitsOn(pi, "skills:query")).toHaveLength(0);
+  });
+
+  it("on session_start subscribes to the seam and issues one skills:query pull", async () => {
+    const { pi, lifecycle, busHandlers } = makePi();
+    subagentsExtension(pi);
+    await lifecycle.get("session_start")({}, ctx());
+
+    expect(busHandlers.has("skills:changed")).toBe(true);
+    expect(busHandlers.has("skill-agents:query")).toBe(true);
+    expect(emitsOn(pi, "skills:query")).toHaveLength(1);
+  });
+
+  it("registers skill agents and publishes rewrite maps on skills:changed", async () => {
+    const { pi, lifecycle, busHandlers } = makePi();
+    subagentsExtension(pi);
+    await lifecycle.get("session_start")({}, ctx());
+
+    const { snapshot, id } = skillSnapshot("simplify", "reviewer");
+    busHandlers.get("skills:changed")!(snapshot);
+
+    // Global registry mutated (root activation owns it): qualified + free bare alias.
+    expect(isValidType("simplify:reviewer")).toBe(true);
+    expect(isValidType("reviewer")).toBe(true);
+
+    const publishes = emitsOn(pi, "skill-agents:rewrite-maps");
+    expect(publishes.length).toBeGreaterThanOrEqual(1);
+    const event = publishes.at(-1)![1];
+    expect(event.maps[id].reviewer.qualified).toBe("simplify:reviewer");
+    expect(event.maps[id].reviewer.collided).toBe(false); // bare alias granted
+  });
+
+  it("answers skill-agents:query with the current maps", async () => {
+    const { pi, lifecycle, busHandlers } = makePi();
+    subagentsExtension(pi);
+    await lifecycle.get("session_start")({}, ctx());
+    const { snapshot, id } = skillSnapshot("simplify", "reviewer");
+    busHandlers.get("skills:changed")!(snapshot);
+
+    busHandlers.get("skill-agents:query")!({ requestId: "q1" });
+    const reply = pi.events.emit.mock.calls.find((c: any[]) => c[0] === "skill-agents:query:reply:q1");
+    expect(reply).toBeTruthy();
+    expect(reply![1].success).toBe(true);
+    expect(reply![1].data.maps[id].reviewer.qualified).toBe("simplify:reviewer");
+  });
+
+  it("ignores a stale snapshot (lower revision)", async () => {
+    const { pi, lifecycle, busHandlers } = makePi();
+    subagentsExtension(pi);
+    await lifecycle.get("session_start")({}, ctx());
+
+    busHandlers.get("skills:changed")!(skillSnapshot("simplify", "reviewer", 5).snapshot);
+    const before = emitsOn(pi, "skill-agents:rewrite-maps").length;
+    // A lower-revision snapshot with a different agent must be ignored.
+    busHandlers.get("skills:changed")!(skillSnapshot("other", "auditor", 4).snapshot);
+    expect(isValidType("other:auditor")).toBe(false);
+    expect(emitsOn(pi, "skill-agents:rewrite-maps").length).toBe(before);
+  });
+
+  it("widens the ready payload to carry the sessionId", async () => {
+    const { pi, lifecycle } = makePi();
+    subagentsExtension(pi);
+    await lifecycle.get("session_start")({}, ctx());
+    expect(readyEmits(pi)[0]![1]).toEqual({ sessionId: "s1" });
+  });
+
+  it("wires the seam exactly once across duplicate session_starts", async () => {
+    const { pi, lifecycle } = makePi();
+    subagentsExtension(pi);
+    await lifecycle.get("session_start")({}, ctx());
+    await lifecycle.get("session_start")({}, ctx());
+    expect(onCallsFor(pi, "skills:changed")).toHaveLength(1);
+    expect(onCallsFor(pi, "skill-agents:query")).toHaveLength(1);
+    expect(emitsOn(pi, "skills:query")).toHaveLength(1);
+  });
+
+  it("drops the skill layer on shutdown", async () => {
+    const { pi, lifecycle, busHandlers } = makePi();
+    subagentsExtension(pi);
+    await lifecycle.get("session_start")({}, ctx());
+    busHandlers.get("skills:changed")!(skillSnapshot("simplify", "reviewer").snapshot);
+    expect(getSkillAgents()).toBeDefined();
+
+    await lifecycle.get("session_shutdown")();
+    expect(getSkillAgents()).toBeUndefined();
   });
 });

@@ -1,24 +1,32 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   BUILTIN_TOOL_NAMES,
+  buildAgentRegistry,
+  clearSkillAgents,
   getAgentConfig,
+  getAllTypes,
   getAvailableTypes,
+  getAvailableTypesIn,
   getConfig,
   getDefaultAgentNames,
   getMemoryToolNames,
   getReadOnlyMemoryToolNames,
+  getSkillAliasDecisions,
   getToolNamesForType,
   getUserAgentNames,
   isDefaultsDisabled,
   isValidType,
+  isValidTypeIn,
   NO_FALLBACK,
   registerAgents,
   resolveEnabledTypeIn,
   resolveSpawnType,
   resolveSpawnTypeIn,
   resolveType,
+  type SkillAgentEntry,
   setDefaultsDisabled,
   setFallbackSubagent,
+  setSkillAgents,
 } from "../src/agent-types.js";
 import { DEFAULT_AGENTS } from "../src/default-agents.js";
 import type { AgentConfig } from "../src/types.js";
@@ -489,5 +497,105 @@ describe("resolveSpawnType — fail-closed dispatch (#183)", () => {
     expect(resolveSpawnTypeIn(registry, "typoo")).toEqual({
       ok: true, type: "router", fellBackFrom: "typoo",
     });
+  });
+});
+
+describe("skill-bundled agent layer (S2)", () => {
+  afterEach(() => {
+    clearSkillAgents();
+    registerAgents(new Map());
+  });
+
+  function entry(
+    skillId: string,
+    qualified: string,
+    bareName: string,
+    cfg: Partial<AgentConfig> = {},
+  ): SkillAgentEntry {
+    return { skillId, qualified, bareName, config: makeAgentConfig({ name: bareName, ...cfg }) };
+  }
+
+  it("always registers the qualified name — hidden, spawnable, but not listed", () => {
+    setSkillAgents([entry("s/SKILL.md", "simplify:reviewer", "reviewer")]);
+    registerAgents(new Map());
+
+    expect(isValidType("simplify:reviewer")).toBe(true);
+    expect(resolveSpawnType("simplify:reviewer")).toEqual({ ok: true, type: "simplify:reviewer" });
+    expect(getAvailableTypes()).not.toContain("simplify:reviewer");
+    expect(getAllTypes()).not.toContain("simplify:reviewer");
+    expect(getAgentConfig("simplify:reviewer")?.skillId).toBe("s/SKILL.md");
+    expect(getAgentConfig("simplify:reviewer")?.hidden).toBe(true);
+    expect(getAgentConfig("simplify:reviewer")?.source).toBe("skill");
+  });
+
+  it("grants a free bare alias — hidden and spawnable", () => {
+    setSkillAgents([entry("s/SKILL.md", "simplify:reviewer", "reviewer")]);
+    registerAgents(new Map());
+
+    expect(isValidType("reviewer")).toBe(true);
+    expect(resolveSpawnType("reviewer")).toEqual({ ok: true, type: "reviewer" });
+    expect(getAvailableTypes()).not.toContain("reviewer");
+    expect(getSkillAliasDecisions()).toContainEqual({
+      skillId: "s/SKILL.md",
+      bareName: "reviewer",
+      qualified: "simplify:reviewer",
+      granted: true,
+    });
+  });
+
+  it("withholds the bare alias on a case-insensitive clash with a user agent", () => {
+    setSkillAgents([entry("s/SKILL.md", "simplify:Reviewer", "Reviewer")]);
+    registerAgents(new Map([["reviewer", makeAgentConfig({ name: "reviewer" })]]));
+
+    expect(isValidType("simplify:Reviewer")).toBe(true); // qualified always works
+    // "Reviewer" resolves to the user agent (case folded), not the skill agent.
+    expect(getAgentConfig("Reviewer")?.skillId).toBeUndefined();
+    expect(getSkillAliasDecisions().find(d => d.bareName === "Reviewer")?.granted).toBe(false);
+  });
+
+  it("withholds a bare alias claimed by two skills — neither wins", () => {
+    setSkillAgents([
+      entry("a/SKILL.md", "a:reviewer", "reviewer"),
+      entry("b/SKILL.md", "b:reviewer", "reviewer"),
+    ]);
+    registerAgents(new Map());
+
+    expect(isValidType("a:reviewer")).toBe(true);
+    expect(isValidType("b:reviewer")).toBe(true);
+    expect(resolveType("reviewer")).toBeUndefined();
+    for (const d of getSkillAliasDecisions()) expect(d.granted).toBe(false);
+  });
+
+  it("lets a user file added later steal the bare name back on rebuild", () => {
+    setSkillAgents([entry("s/SKILL.md", "simplify:reviewer", "reviewer")]);
+    registerAgents(new Map());
+    expect(getSkillAliasDecisions().find(d => d.bareName === "reviewer")?.granted).toBe(true);
+
+    registerAgents(new Map([["reviewer", makeAgentConfig({ name: "reviewer" })]]));
+    expect(getAgentConfig("reviewer")?.skillId).toBeUndefined(); // user wins the bare name
+    expect(getSkillAliasDecisions().find(d => d.bareName === "reviewer")?.granted).toBe(false);
+    expect(isValidType("simplify:reviewer")).toBe(true); // qualified survives
+  });
+
+  it("applies the layer through the pure buildAgentRegistry path (frozen input 3)", () => {
+    const layer = [entry("s/SKILL.md", "simplify:reviewer", "reviewer")];
+    const { registry } = buildAgentRegistry(new Map(), { skillAgents: layer });
+
+    expect(registry.has("simplify:reviewer")).toBe(true);
+    expect(registry.has("reviewer")).toBe(true);
+    expect(isValidTypeIn(registry, "simplify:reviewer")).toBe(true); // spawnable
+    expect(getAvailableTypesIn(registry)).not.toContain("simplify:reviewer"); // hidden
+  });
+
+  it("clears the layer on the next registerAgents", () => {
+    setSkillAgents([entry("s/SKILL.md", "simplify:reviewer", "reviewer")]);
+    registerAgents(new Map());
+    expect(isValidType("simplify:reviewer")).toBe(true);
+
+    clearSkillAgents();
+    registerAgents(new Map());
+    expect(isValidType("simplify:reviewer")).toBe(false);
+    expect(isValidType("reviewer")).toBe(false);
+    expect(getSkillAliasDecisions()).toEqual([]);
   });
 });
