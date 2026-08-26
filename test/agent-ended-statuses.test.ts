@@ -32,6 +32,11 @@ function makePi() {
   const busHandlers = new Map<string, (raw: any) => unknown>();
   const pi = {
     registerMessageRenderer: vi.fn(),
+    registerEntryRenderer: vi.fn(),
+    registerFlag: vi.fn(),
+    getFlag: vi.fn(),
+    getAllTools: vi.fn(() => [] as any[]),
+    setActiveTools: vi.fn(),
     registerTool: vi.fn(),
     registerCommand: vi.fn(),
     on: vi.fn((event: string, handler: any) => lifecycle.set(event, handler)),
