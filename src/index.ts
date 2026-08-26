@@ -634,9 +634,10 @@ export default function (pi: ExtensionAPI) {
     // v3: a terminal event for every transition, carrying the record's native
     // status verbatim (completed | steered | error | aborted | stopped). Core
     // derives ok = !(error|stopped|aborted); no status-normalizing here.
-    // The guard narrows to the terminal set rather than asserting it: this
-    // callback only ever runs from a settle path, and core drops a payload whose
-    // status is not one of them anyway.
+    // The guard narrows to the terminal set rather than asserting it: every
+    // caller is a settle path or `abort`'s queued branch, both of which set a
+    // terminal status first, and core drops a payload whose status is not one
+    // of them anyway.
     if (record.status !== "queued" && record.status !== "running") {
       agentEndedGate.emit({
         agentId: record.id,

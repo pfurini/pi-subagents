@@ -8,7 +8,7 @@ For the channel list, the reply envelope, the per-channel snippets and the event
 
 ## Spawn options
 
-`subagents:rpc:spawn` forwards `options` to `AgentManager.spawn` — but not verbatim. The manager's `spawn` behind the RPC is `spawnTopLevel` (`src/index.ts:698-721`), which deletes internal-only fields first, and then `spawnResolved` (`src/index.ts:666-696`) overwrites the activity-tracker callbacks with its own. The full interface is `SpawnOptions` at `src/agent-manager.ts:169-303`; what a bus caller actually gets is three different things.
+`subagents:rpc:spawn` forwards `options` to `AgentManager.spawn` — but not verbatim. The manager's `spawn` behind the RPC is `spawnTopLevel` (`src/index.ts:763-787`), which deletes internal-only fields first, and then `spawnResolved` (`src/index.ts:731-761`) overwrites the activity-tracker callbacks with its own. The full interface is `SpawnOptions` at `src/agent-manager.ts:169-303`; what a bus caller actually gets is three different things.
 
 **Honoured** — set these and they take effect:
 
@@ -43,7 +43,7 @@ For the channel list, the reply envelope, the per-channel snippets and the event
 | `reclaim` | Bypasses handle allocation, so a forged value would duplicate a live agent's name and make `@handle` ambiguous |
 | `blocking` | Every spawn through here is detached. A forged `blocking` would charge it to the foreground pool and defer it behind a queue whose gate nobody is holding |
 
-**Silently overwritten** — `onToolActivity`, `onTextDelta`, `onTurnEnd`, `onSessionCreated` and `onAssistantUsage` are replaced by the activity tracker's own (`src/index.ts:693`). Every programmatic spawn passes through one funnel so none can supply half-wired callbacks; a half-wired tracker renders worse than none, which is the bug behind a row that reads `thinking…` for an agent's whole life ([#181](https://github.com/tintinweb/pi-subagents/pull/181)).
+**Silently overwritten** — `onToolActivity`, `onTextDelta`, `onTurnEnd`, `onSessionCreated` and `onAssistantUsage` are replaced by the activity tracker's own (`src/index.ts:755-758`). Every programmatic spawn passes through one funnel so none can supply half-wired callbacks; a half-wired tracker renders worse than none, which is the bug behind a row that reads `thinking…` for an agent's whole life ([#181](https://github.com/tintinweb/pi-subagents/pull/181)).
 
 Four things that are not obvious from the tables:
 
@@ -69,26 +69,26 @@ One of these already shipped as a bug in this project's own README example, so i
 
 ## Errors
 
-Every failure reaches the caller as `{ success: false, error }`, where `error` is `err?.message ?? String(err)` (`src/cross-extension-rpc.ts:87`) — so these strings are what you will actually see.
+Every failure reaches the caller as `{ success: false, error }`, where `error` is `err?.message ?? String(err)` (`src/cross-extension-rpc.ts:153`) — so these strings are what you will actually see.
 
 | Error | Source |
 |---|---|
-| `No active session` | `src/cross-extension-rpc.ts:107` — called before the first bound `session_start`, or in a session that excludes pi-subagents |
-| `Model override "<label>" provided but ctx.modelRegistry is unavailable` | `src/cross-extension-rpc.ts:126` |
+| `No active session` | `src/cross-extension-rpc.ts:177` — called before the first bound `session_start`, or in a session that excludes pi-subagents |
+| `Model override "<label>" provided but ctx.modelRegistry is unavailable` | `src/cross-extension-rpc.ts:196` |
 | `Model not found: "<input>".` + available models | `src/model-resolver.ts:117` |
 | `Model not in scope: "<input>".` + allowed models | `src/model-scope.ts:62` — only with `scopeModels` on, and checked against the *resolved* model |
-| `Unknown or disabled agent type: "<raw>". Available: <list>.` | `src/agent-types.ts:187` — only under `fallbackSubagent: none` |
-| `No agent type given. Available: <list>.` | `src/agent-types.ts:187-194` — same condition |
-| `<reason> The configured fallbackSubagent "<x>" is itself unknown or disabled. Available: <list>.` | `src/agent-types.ts:205-207` |
+| `Unknown or disabled agent type: "<raw>". Available: <list>.` | `src/agent-types.ts:307`, `:314` — only under `fallbackSubagent: none` |
+| `No agent type given. Available: <list>.` | `src/agent-types.ts:307`, `:314` — same condition |
+| `<reason> The configured fallbackSubagent "<x>" is itself unknown or disabled. Available: <list>.` | `src/agent-types.ts:324-327` |
 | `SpawnOptions.cwd must be an absolute path: "<value>"` | `src/agent-manager.ts:85` |
 | `SpawnOptions.cwd does not exist: "<cwd>"` | `src/agent-manager.ts:91` |
 | `SpawnOptions.cwd is not a directory: "<cwd>"` | `src/agent-manager.ts:94` |
 | `Cannot run with isolation: "worktree" — not a git repo, no commits yet, or 'git worktree add' failed.` | `src/agent-manager.ts:716-719`, surfaced through `awaitStartup` |
 | git plumbing failures | `src/worktree.ts:76` |
-| `Agent not found` | stop — `src/cross-extension-rpc.ts:170` |
-| `Agent is owned by another agent or workflow` | stop — `:178` |
-| `Agent is not running` | stop — `:182`. The record exists, so it has already settled |
-| `Agent not found or still running` | consume — `:193` |
+| `Agent not found` | stop — `src/cross-extension-rpc.ts:248` |
+| `Agent is owned by another agent or workflow` | stop — `:256` |
+| `Agent is not running` | stop — `:260`. The record exists, so it has already settled |
+| `Agent not found or still running` | consume — `:271` |
 
 Three things the table cannot show:
 
@@ -98,14 +98,14 @@ Three things the table cannot show:
 
 ## Ownership
 
-`isTopLevelAgent(record)` is `parentAgentId === undefined && workflowId === undefined` (`src/agent-manager.ts:122-126`). `subagents:rpc:stop` enforces it (`src/cross-extension-rpc.ts:178`): a nested child or a workflow's agent is owned by something that is *waiting on it*, and aborting it out from under that owner turns another extension's stop into a failed step. It is defence in depth rather than a live hole — no RPC hands out agent ids, so a caller has no ordinary way to name one it does not own.
+`isTopLevelAgent(record)` is `parentAgentId === undefined && workflowId === undefined` (`src/agent-manager.ts:122-126`). `subagents:rpc:stop` enforces it (`src/cross-extension-rpc.ts:256`): a nested child or a workflow's agent is owned by something that is *waiting on it*, and aborting it out from under that owner turns another extension's stop into a failed step. It is defence in depth rather than a live hole — no RPC hands out agent ids, so a caller has no ordinary way to name one it does not own.
 
 Two asymmetries to know about, stated as they are:
 
-- **Stop takes an id only** (`src/index.ts:806`). Consume takes an id *or* an `@handle`, through `resolveAgentRef` (`src/index.ts:816` → `:731-736`).
-- **Consume checks `parentAgentId` but not `workflowId`** (`src/index.ts:816`). A workflow-owned agent's result can be marked consumed over the bus even though the same agent cannot be stopped.
+- **Stop takes an id only** (`src/index.ts:905`). Consume takes an id *or* an `@handle`, through `resolveAgentRef` (`src/index.ts:907` → `:796-802`).
+- **Consume checks `parentAgentId` but not `workflowId`** (`src/index.ts:911`). A workflow-owned agent's result can be marked consumed over the bus even though the same agent cannot be stopped.
 
-The same predicate silently scopes the events. **Every lifecycle event is top-level only** — `subagents:started`, `:completed`, `:failed` and `:compacted` all return early for nested and workflow-owned agents (`src/index.ts:573`, `:615`, `:631`). A workflow's children are invisible on the bus: you will see the workflow's own agents come and go without a single event.
+The same predicate silently scopes the events. **Every lifecycle event is top-level only** — `subagents:started`, `:completed`, `:failed` and `:compacted` all return early for nested and workflow-owned agents (`src/index.ts:624`, `:680`, `:696`). A workflow's children are invisible on the bus: you will see the workflow's own agents come and go without a single event.
 
 ## The notification race
 
@@ -113,25 +113,25 @@ When a background agent finishes, pi-subagents sends the user a completion notif
 
 **When you send it decides whether it works.** The timeline:
 
-1. The agent settles and `subagents:completed` is emitted — `src/index.ts:581`.
-2. Eleven lines later, at `src/index.ts:592`, the code checks `record.resultConsumed` and decides whether to notify at all.
+1. The agent settles and `subagents:completed` is emitted — `src/index.ts:632`.
+2. Further down, at `src/index.ts:657`, the code checks `record.resultConsumed` and decides whether to notify at all.
 3. `pi.events` dispatch is synchronous and in-process, so a handler that emits `subagents:rpc:consume` **without awaiting anything** has already set that flag before step 2 evaluates.
 
 | When you consume | What happens |
 |---|---|
 | Synchronously, inside your `subagents:completed` handler | The notification is never scheduled. This is the clean path |
-| After an `await`, within 200 ms | Still suppressed. The nudge is held for `NUDGE_HOLD_MS` (`src/index.ts:451`), `consume` cancels the pending timer (`:819`), and there is a re-check at send time (`:474`) |
+| After an `await`, within 200 ms | Still suppressed. The nudge is held for `NUDGE_HOLD_MS` (`src/index.ts:498`), `consume` cancels the pending timer (`:914`), and there is a re-check at send time (`:521`) |
 | After 200 ms | Too late. The follow-up has fired with `triggerTurn: true` and cost the parent a turn |
 
-Fire-and-forget is the intended use: the reply carries nothing to act on, and the channel sits outside the `subagents:rpc:ping` version handshake on purpose (`src/cross-extension-rpc.ts:190`), so you can send it unconditionally and an older pi-subagents with no handler simply keeps notifying.
+Fire-and-forget is the intended use: the reply carries nothing to act on, and the channel sits outside the `subagents:rpc:ping` version handshake on purpose (`src/cross-extension-rpc.ts:267-269`), so you can send it unconditionally and an older pi-subagents with no handler simply keeps notifying.
 
-Consumption is not terminal. An `@handle` steer un-consumes the record (`src/index.ts:920`) because the agent's reply to that message still needs relaying, and so does a background resume (`src/agent-manager.ts:1135`) because the record is starting a new run.
+Consumption is not terminal. An `@handle` steer un-consumes the record (`src/index.ts:1020`) because the agent's reply to that message still needs relaying, and so does a background resume (`src/agent-manager.ts:1135`) because the record is starting a new run.
 
-One related thing that lives nowhere else: on every top-level settle, pi-subagents writes a session entry — not an event — via `pi.appendEntry("subagents:record", …)` (`src/index.ts:585`), carrying `id`, `type`, `description`, `status`, `result`, `error`, `startedAt` and `completedAt`. It exists for cross-extension history reconstruction. It is append-only history, not something to react to.
+One related thing that lives nowhere else: on every top-level settle, pi-subagents writes a session entry — not an event — via `pi.appendEntry("subagents:record", …)` (`src/index.ts:650`), carrying `id`, `type`, `description`, `status`, `result`, `error`, `startedAt` and `completedAt`. It exists for cross-extension history reconstruction. It is append-only history, not something to react to.
 
 ## The manager registry
 
-`globalThis[Symbol.for("pi-subagents:manager")]` (`src/index.ts:649-659`) is a second integration surface — the standard Node cross-package singleton pattern, no bus involved:
+`globalThis[Symbol.for("pi-subagents:manager")]` (`src/index.ts:803-811`) is a second integration surface — the standard Node cross-package singleton pattern, no bus involved:
 
 | Member | Signature | Notes |
 |---|---|---|
@@ -140,7 +140,7 @@ One related thing that lives nowhere else: on every top-level settle, pi-subagen
 | `spawn(pi, ctx, type, prompt, options)` | `=> string` | **Is** `spawnTopLevel`, so the strip list above applies identically |
 | `getRecord(id)` | `=> AgentRecord \| undefined` | Filtered through `isTopLevelAgent`, so someone else's child comes back `undefined` rather than leaking |
 
-The slot is claimed by the first activation only; subagent sessions re-activate this extension in the same process, and unconditionally overwriting would point the registry at a short-lived child manager whose shutdown would then delete the root session's entry ([#128](https://github.com/tintinweb/pi-subagents/pull/128)). Child activations leave it alone, and shutdown releases it only if this activation claimed it (`src/index.ts:747-750`, `:1105-1107`).
+The slot is claimed by the first activation only; subagent sessions re-activate this extension in the same process, and unconditionally overwriting would point the registry at a short-lived child manager whose shutdown would then delete the root session's entry ([#128](https://github.com/tintinweb/pi-subagents/pull/128)). Child activations leave it alone (`src/index.ts:812-815`), and shutdown releases it only if this activation claimed it (`src/index.ts:1209-1211`).
 
 Prefer the bus. The registry has no reply envelope, no version, and no availability event — `globalThis[Symbol.for("pi-subagents:manager")] === undefined` is the only probe you get, and it is also `undefined` in a session that filtered pi-subagents out. Reach for it for the two things the bus has no verb for — *is anything still running*, and *give me a settled record back* — or for a headless host that wants to block on `waitForAll()` before exiting.
 
@@ -156,11 +156,11 @@ Require `version >= 3` or `capabilities.skillAgents === true` when qualified ski
 
 ## Availability
 
-`subagents:ready` is the discovery signal, and both the RPC handlers and the event itself are wired on the first bound `session_start` (`src/index.ts:789`, `:799`, `:827`) — deliberately not at factory time. pi runs every extension factory *before* applying an agent's `extensions:` filter and only delivers lifecycle events to the survivors, so a factory-time broadcast made a filtered-out session advertise a spawn service it could never provide: `ping` succeeded and every `spawn` answered `No active session` ([#142](https://github.com/tintinweb/pi-subagents/issues/142)).
+`subagents:ready` is the discovery signal, and both the RPC handlers and the event itself are wired on the first bound `session_start` (`src/index.ts:884`, `:894`, `:927`) — deliberately not at factory time. pi runs every extension factory *before* applying an agent's `extensions:` filter and only delivers lifecycle events to the survivors, so a factory-time broadcast made a filtered-out session advertise a spawn service it could never provide: `ping` succeeded and every `spawn` answered `No active session` ([#142](https://github.com/tintinweb/pi-subagents/issues/142)).
 
 The consequence is worth stating plainly: **a session that excludes pi-subagents is indistinguishable from pi-subagents not being installed.** It emits no `subagents:ready` and answers nothing. Give discovery a timeout and treat expiry as "not available here" rather than waiting indefinitely. The payload is `{ sessionId }`; consumers that only need availability may ignore it. Handlers are torn down and the flag reset on `session_shutdown`, so a later `session_start` re-registers and re-emits.
 
-One more trap on the way in: an RPC-spawned agent emits **no `subagents:created`**. The only two emit sites are the `Agent` tool's background branch (`src/index.ts:2104`) and detached resume (`:1350`). Your first event for your own agent is `subagents:started` (`:625`), so key your bookkeeping off the id that `spawn` handed you, not off `subagents:created`.
+One more trap on the way in: an RPC-spawned agent emits **no `subagents:created`**. The only two emit sites are the `Agent` tool's background branch (`src/index.ts:2210`) and detached resume (`:1453`). Your first event for your own agent is `subagents:started` (`:690`), so key your bookkeeping off the id that `spawn` handed you, not off `subagents:created`.
 
 ## What the tests pin
 

@@ -271,6 +271,54 @@ describe("maxConcurrentForeground", () => {
       expect((await queued).record.status).toBe("stopped");
     });
 
+    // A blocking caller is woken by the dequeue and reports the stop from its
+    // own tool result, so the nudge for it would say the same thing twice —
+    // and, since a queued record never reaches settleRun to be marked consumed,
+    // the second telling would be a followUp with triggerTurn, costing a turn
+    // the user's Esc never asked for. Marked consumed here instead, so the bus
+    // events still fire and only the notification is suppressed.
+    it("marks an aborted queued agent consumed when a caller is blocking on it", async () => {
+      const completions: string[] = [];
+      controllableRuns();
+      manager = new AgentManager(record => { completions.push(record.id); });
+      manager.setMaxConcurrentForeground(1);
+
+      void fg(manager, "holder");
+      const queued = fg(manager, "victim");
+      const victim = recordFor(manager, "victim");
+      expect(victim.status).toBe("queued");
+
+      expect(manager.abort(victim.id)).toBe(true);
+      expect((await queued).record.status).toBe("stopped");
+      await flush();
+
+      // The terminal transition still reaches the bus — only the duplicate
+      // notification is held back, which is what `resultConsumed` gates.
+      expect(completions).toEqual([victim.id]);
+      expect(victim.resultConsumed).toBe(true);
+    });
+
+    // The other half: a detached spawn has no inline caller to learn from, so
+    // it must stay unconsumed and get its notification — otherwise nothing
+    // reports the stop at all and an RPC waiter blocks to its cap.
+    it("leaves an aborted queued agent unconsumed when it is detached", async () => {
+      const completions: string[] = [];
+      controllableRuns();
+      manager = new AgentManager(record => { completions.push(record.id); });
+      manager.setMaxConcurrent(1);
+
+      bg(manager, "holder");
+      const victimId = bg(manager, "victim");
+      expect(recordFor(manager, "victim").status).toBe("queued");
+
+      expect(manager.abort(victimId)).toBe(true);
+      await flush();
+
+      expect(completions).toEqual([victimId]);
+      expect(recordFor(manager, "victim").status).toBe("stopped");
+      expect(recordFor(manager, "victim").resultConsumed).not.toBe(true);
+    });
+
     // addEventListener never fires on an already-aborted signal, so enqueueing
     // here would wait forever — pi has no tool-execution timeout to bail out.
     it("never enqueues a spawn whose signal is already aborted", async () => {

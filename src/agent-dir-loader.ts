@@ -151,19 +151,6 @@ export function loadAgentsFromDirectoryInto(
 }
 
 /**
- * Read and parse one agent file, or warn and return undefined for the caller to
- * skip. One bad file must not take the whole extension down with it — an
- * unparseable `.md` used to abort activation, so pi exited before the TUI.
- *
- * The path is as much of the fix as the recovery: a bare YAML error ("line 2,
- * column 14") is unactionable when agents come from three directories at once,
- * and the only other symptom is `Unknown agent type`, which reads like a typo.
- *
- * Under `strict` the same failure rethrows, still naming the path, so callers
- * that opted into failing closed stop rather than run a substituted agent.
- */
-
-/**
  * Parse an agent file's frontmatter, tolerating a leading UTF-8 BOM.
  *
  * Editors across the Windows/CJK world write UTF-8 with a BOM by default, and
@@ -181,6 +168,18 @@ export function parseAgentFrontmatter<T extends Record<string, unknown>>(
   return parseFrontmatter<T>(content.startsWith("\uFEFF") ? content.slice(1) : content);
 }
 
+/**
+ * Read and parse one agent file, or warn and return undefined for the caller to
+ * skip. One bad file must not take the whole extension down with it — an
+ * unparseable `.md` used to abort activation, so pi exited before the TUI.
+ *
+ * The path is as much of the fix as the recovery: a bare YAML error ("line 2,
+ * column 14") is unactionable when agents come from three directories at once,
+ * and the only other symptom is `Unknown agent type`, which reads like a typo.
+ *
+ * Under `strict` the same failure rethrows, still naming the path, so callers
+ * that opted into failing closed stop rather than run a substituted agent.
+ */
 function readAgentFile(path: string, strict: boolean): { frontmatter: Record<string, unknown>; body: string } | undefined {
   try {
     return parseAgentFrontmatter<Record<string, unknown>>(readFileSync(path, "utf-8"));

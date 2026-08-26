@@ -1408,9 +1408,7 @@ export class AgentManager {
     const record = this.agents.get(id);
     if (!record) return false;
 
-    // Remove from queue if queued. No decrement — the slot was never taken —
-    // and no onComplete, matching what a queued background abort has always
-    // done; a blocking caller learns of the stop from its own tool result.
+    // Remove from queue if queued. No decrement — the slot was never taken.
     if (record.status === "queued") {
       this.dequeue(q => q.id === id);
       record.status = "stopped";
@@ -1418,6 +1416,16 @@ export class AgentManager {
       // A queued record never reaches a settle path, so route its cancellation
       // through the same terminal notification as any other stop — otherwise no
       // completion fires at all and a foreground RPC waiter hangs to its cap.
+      //
+      // Marked consumed first when a caller is blocking on it, exactly as
+      // `launch` does on the foreground-queued failure path: the `dequeue`
+      // above wakes that caller, which reports the stop from its own tool
+      // result, so the nudge would say the same thing twice — and, since the
+      // record never reaches `settleRun` to be marked there, it would be a
+      // followUp with `triggerTurn`, costing a turn the user's Esc never asked
+      // for. The bus events and the session entry still fire either way; only
+      // the duplicate notification is suppressed.
+      if (record.blocking) record.resultConsumed = true;
       try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
       return true;
     }
