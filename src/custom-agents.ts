@@ -38,3 +38,5 @@ export function loadCustomAgents(cwd: string, strict = false): Map<string, Agent
   resetLoadWarnings();
   return agents;
 }
+
+export { parseAgentFrontmatter } from "./agent-dir-loader.js";

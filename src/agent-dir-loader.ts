@@ -151,6 +151,24 @@ export function loadAgentsFromDirectoryInto(
 }
 
 /**
+ * Parse an agent file's frontmatter, tolerating a leading UTF-8 BOM.
+ *
+ * Editors across the Windows/CJK world write UTF-8 with a BOM by default, and
+ * pi's parser did not look past one before 0.84.3: the fence never matched, so
+ * the frontmatter came back empty and the whole file became the body. An agent
+ * authored that way silently lost every field. `tools: none` going missing is
+ * the sharp edge because it grants the default toolset instead of no tools.
+ *
+ * Normalize the encoding artifact at this shared parsing boundary so user and
+ * skill-bundled agents behave consistently across the supported pi versions.
+ */
+export function parseAgentFrontmatter<T extends Record<string, unknown>>(
+  content: string,
+): { frontmatter: T; body: string } {
+  return parseFrontmatter<T>(content.startsWith("\uFEFF") ? content.slice(1) : content);
+}
+
+/**
  * Read and parse one agent file, or warn and return undefined for the caller to
  * skip. One bad file must not take the whole extension down with it — an
  * unparseable `.md` used to abort activation, so pi exited before the TUI.
@@ -164,7 +182,7 @@ export function loadAgentsFromDirectoryInto(
  */
 function readAgentFile(path: string, strict: boolean): { frontmatter: Record<string, unknown>; body: string } | undefined {
   try {
-    return parseFrontmatter<Record<string, unknown>>(readFileSync(path, "utf-8"));
+    return parseAgentFrontmatter<Record<string, unknown>>(readFileSync(path, "utf-8"));
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     if (strict) throw new Error(`${path}: ${reason}`);
