@@ -14,6 +14,11 @@ media/
 AGENTS.md
 CLAUDE.md
 
+# One-shot local maintenance scripts. unnest-subagent-sessions.mjs moves files a
+# user already has; it must be run deliberately from a checkout, never found and
+# run out of an installed package.
+scripts/
+
 # Build artifacts
 *.log
 npm-debug.log*

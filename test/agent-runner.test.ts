@@ -257,8 +257,15 @@ describe("agent-runner final output capture", () => {
     }));
     expect(settingsManagerCreate).toHaveBeenCalledWith("/tmp/worktree", "/mock/agent-dir");
     // Same claim as before `rememberAgents` flipped the default — the effective
-    // cwd reaches the session manager — now via the persistent constructor.
-    expect(sessionManagerCreate).toHaveBeenCalledWith("/tmp/worktree", undefined, expect.anything());
+    // cwd reaches the session manager — now via the persistent constructor, and
+    // as a resolved path rather than `undefined`: with no session dir configured
+    // anywhere, the runner derives pi's own project directory for that cwd and
+    // nests inside it instead of letting pi derive the bare project directory.
+    expect(sessionManagerCreate).toHaveBeenCalledWith(
+      "/tmp/worktree",
+      "/mock/agent-dir/sessions/--tmp-worktree--/.subagents",
+      expect.anything(),
+    );
     expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({
       cwd: "/tmp/worktree",
       agentDir: "/mock/agent-dir",
@@ -949,10 +956,10 @@ describe("agent-runner session persistence", () => {
     // the point of a resume is that the history is already there.
     expect(sessionManagerCreate).not.toHaveBeenCalled();
     expect(sessionManagerInMemory).not.toHaveBeenCalled();
-    expect(sessionManagerOpen).toHaveBeenCalledWith("/sessions/explore.jsonl", "/normal/pi/sessions");
+    expect(sessionManagerOpen).toHaveBeenCalledWith("/sessions/explore.jsonl", "/normal/pi/sessions/.subagents");
   });
 
-  it("uses pi's normal persistent session location and links to the parent session", async () => {
+  it("nests under the configured session directory, and links to the parent session", async () => {
     vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ persistSession: true }));
     settingsManagerGetSessionDir.mockReturnValue("/normal/pi/sessions");
     const { session } = createSession("OK");
@@ -963,7 +970,7 @@ describe("agent-runner session persistence", () => {
     expect(sessionManagerInMemory).not.toHaveBeenCalled();
     expect(sessionManagerCreate).toHaveBeenCalledWith(
       "/tmp",
-      "/normal/pi/sessions",
+      "/normal/pi/sessions/.subagents",
       { parentSession: "/sessions/parent.jsonl" },
     );
     expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({
@@ -971,7 +978,7 @@ describe("agent-runner session persistence", () => {
     }));
   });
 
-  it("uses a frontmatter sessionDir when persistSession is true and sessionDir is configured", async () => {
+  it("uses a frontmatter sessionDir verbatim when persistSession is true and sessionDir is configured", async () => {
     vi.mocked(getAgentConfig).mockReturnValueOnce(
       makeAgentConfig({ persistSession: true, sessionDir: ".seams/pi-sessions/seam-plan-reviewer" }),
     );
@@ -981,9 +988,83 @@ describe("agent-runner session persistence", () => {
 
     await runAgent(ctx, "Explore", "go", { pi, cwd: "/repo" });
 
+    // No `.subagents` here: `session_dir:` is a deliberate per-agent placement,
+    // already outside the directory pi scans for this project, so nesting inside
+    // it would only make the path the user chose harder to predict.
     expect(sessionManagerCreate).toHaveBeenCalledWith(
       "/repo",
       "/repo/.seams/pi-sessions/seam-plan-reviewer",
+      { parentSession: "/sessions/parent.jsonl" },
+    );
+  });
+
+  it("derives pi's project session directory when nothing configures one", async () => {
+    // Locks the encoding against pi's `getDefaultSessionDirPath`, which this
+    // reproduces because the package exports no way to call it. Drift here means
+    // subagent sessions land beside a project directory rather than inside it.
+    for (const [cwd, encoded] of [
+      ["/tmp", "--tmp--"],
+      ["/Users/x/Developer/ai/pi", "--Users-x-Developer-ai-pi--"],
+      ["/a/b/", "--a-b--"],
+      ["/with spaces/and.dots", "--with spaces-and.dots--"],
+    ] as const) {
+      sessionManagerCreate.mockClear();
+      vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ persistSession: true }));
+      createAgentSession.mockResolvedValue({ session: createSession("OK").session });
+
+      await runAgent(ctx, "Explore", "go", { pi, cwd });
+
+      expect(sessionManagerCreate).toHaveBeenCalledWith(
+        cwd,
+        `/mock/agent-dir/sessions/${encoded}/.subagents`,
+        expect.anything(),
+      );
+    }
+  });
+
+  it("gives create and open the same directory, so a /new off a resume stays nested", async () => {
+    // They read one resolved value. Were they to diverge, reopening a subagent
+    // transcript and starting a new session from it would write that new session
+    // back into the project directory this whole arrangement keeps clear.
+    vi.mocked(getAgentConfig).mockReturnValue(makeAgentConfig({ persistSession: true }));
+    createAgentSession.mockResolvedValue({ session: createSession("OK").session });
+    await runAgent(ctx, "Explore", "go", { pi });
+
+    createAgentSession.mockResolvedValue({ session: createSession("OK").session });
+    await runAgent(ctx, "Explore", "carry on", { pi, resumeSessionFile: "/sessions/explore.jsonl" });
+
+    expect(sessionManagerOpen.mock.calls[0][1]).toBe(sessionManagerCreate.mock.calls[0][1]);
+    vi.mocked(getAgentConfig).mockReset();
+  });
+
+  it("nests under PI_CODING_AGENT_SESSION_DIR, which still wins over the settings value", async () => {
+    const previous = process.env.PI_CODING_AGENT_SESSION_DIR;
+    process.env.PI_CODING_AGENT_SESSION_DIR = "/env/sessions";
+    try {
+      vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ persistSession: true }));
+      settingsManagerGetSessionDir.mockReturnValue("/normal/pi/sessions");
+      createAgentSession.mockResolvedValue({ session: createSession("OK").session });
+
+      await runAgent(ctx, "Explore", "go", { pi });
+
+      expect(sessionManagerCreate).toHaveBeenCalledWith("/tmp", "/env/sessions/.subagents", expect.anything());
+    } finally {
+      if (previous === undefined) delete process.env.PI_CODING_AGENT_SESSION_DIR;
+      else process.env.PI_CODING_AGENT_SESSION_DIR = previous;
+    }
+  });
+
+  it("nests a persisted nested child exactly like a top-level one", async () => {
+    // A nested agent is as machine-driven as a top-level one, so opting one into
+    // persistence must not put it back in the directory pi scans.
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ persistSession: true }));
+    createAgentSession.mockResolvedValue({ session: createSession("OK").session });
+
+    await runAgent(ctx, "Explore", "go", { pi, nested: true });
+
+    expect(sessionManagerCreate).toHaveBeenCalledWith(
+      "/tmp",
+      "/mock/agent-dir/sessions/--tmp--/.subagents",
       { parentSession: "/sessions/parent.jsonl" },
     );
   });

@@ -607,6 +607,41 @@ function resolveConfiguredSessionDir(sessionDir: string | undefined, cwd: string
   return resolve(cwd, sessionDir);
 }
 
+/**
+ * Directory holding subagent sessions inside the session directory pi would
+ * otherwise have put them in.
+ *
+ * Since `rememberAgents`, every spawn writes a session file, and pi has no way
+ * to tell a machine-driven session from one a person typed. Landing them in the
+ * project session directory therefore fed delegation prompts to everything that
+ * scans it: project-scope prompt history, `--continue`'s newest-by-mtime lookup,
+ * `--session <id>` resolution, and `/resume` (where they nested as child rows
+ * under their spawner). All four read ONE directory level and keep only names
+ * ending in `.jsonl`, so a single level of nesting removes the files from every
+ * one of them while leaving them fully recorded and openable by explicit path.
+ *
+ * The leading dot marks it non-user-facing. It can never be mistaken for an
+ * encoded-cwd project directory either — pi always spells those `--<path>--`,
+ * and this sits one level below one, not beside them.
+ */
+const SUBAGENT_SESSION_DIR_NAME = ".subagents";
+
+/**
+ * pi's default project session directory for `cwd` — `<agentDir>/sessions/--<encoded cwd>--`.
+ *
+ * Reproduced rather than imported: `@earendil-works/pi-coding-agent` exports
+ * `SessionManager` but not `getDefaultSessionDir`, and its `exports` map offers
+ * no deep-import path to reach it. Kept byte-compatible with pi's
+ * `getDefaultSessionDirPath`, which pins `agentDir` to the same `getAgentDir()`
+ * this receives; `test/agent-runner.test.ts` locks the encoding so a pi-side
+ * change surfaces as a failing test rather than as misplaced files.
+ */
+function defaultProjectSessionDir(cwd: string, agentDir: string): string {
+  const expanded = cwd === "~" || cwd.startsWith("~/") ? resolve(homedir(), cwd.slice(2)) : cwd;
+  const safePath = `--${resolve(expanded).replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
+  return join(agentDir, "sessions", safePath);
+}
+
 export async function runAgent(
   ctx: ExtensionContext,
   type: SubagentType,
@@ -958,6 +993,14 @@ export async function runAgent(
   const settingsManager = SettingsManager.create(configCwd, agentDir);
   const configuredSessionDir = resolveConfiguredSessionDir(agentConfig?.sessionDir, effectiveCwd);
   const defaultSessionDir = process.env.PI_CODING_AGENT_SESSION_DIR ?? settingsManager.getSessionDir?.();
+  // `session_dir:` is a deliberate per-agent placement, so it is honoured verbatim.
+  // Everything else resolves to a directory pi scans for sessions a person started,
+  // which is exactly what a subagent must stay out of — see SUBAGENT_SESSION_DIR_NAME.
+  // Both construction paths below read this one value: were they to disagree, a later
+  // /new or /branch off a resumed subagent session would write back into the project
+  // directory this exists to keep clear.
+  const sessionDir = configuredSessionDir
+    ?? join(defaultSessionDir ?? defaultProjectSessionDir(effectiveCwd, agentDir), SUBAGENT_SESSION_DIR_NAME);
   // Frontmatter wins when it says anything; otherwise the project default,
   // which `rememberAgents` supplies for top-level agents only. Same precedence
   // as `outputTranscript`.
@@ -966,14 +1009,16 @@ export async function runAgent(
     // Reopening an existing conversation: the file already carries its own
     // header (cwd, parent) and history, so none of the create-time options
     // apply. `sessionDir` still matters for a later /new or /branch off it.
-    ? SessionManager.open(options.resumeSessionFile, configuredSessionDir ?? defaultSessionDir)
+    ? SessionManager.open(options.resumeSessionFile, sessionDir)
     : persistSession
-      ? SessionManager.create(effectiveCwd, configuredSessionDir ?? defaultSessionDir, {
-          // Optional metadata — it only nests the subagent under its spawner in
-          // `/resume`. Until `rememberAgents` this ran solely for the rare
-          // `persist_session: true` agent; now it runs for every spawn, so a
-          // context without a session manager (a bare programmatic ctx) must
-          // still persist rather than take the whole spawn down.
+      ? SessionManager.create(effectiveCwd, sessionDir, {
+          // The only durable link from a subagent transcript back to its spawner.
+          // It no longer nests the two in `/resume` — the child is not listed there
+          // at all now — but it is what identifies an orphaned file as machine-written
+          // (see scripts/unnest-subagent-sessions.mjs). Until `rememberAgents` this ran
+          // solely for the rare `persist_session: true` agent; now it runs for every
+          // spawn, so a context without a session manager (a bare programmatic ctx)
+          // must still persist rather than take the whole spawn down.
           parentSession: ctx.sessionManager?.getSessionFile?.(),
         })
       : SessionManager.inMemory(effectiveCwd);
