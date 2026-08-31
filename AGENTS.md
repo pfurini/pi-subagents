@@ -58,7 +58,7 @@ Read the file that covers a surface before changing its behavior; update it in t
 
 ## Git
 
-- **Never commit.** The user commits manually. At most, suggest a concise commit message as text.
+- **Commit when the request implies it, otherwise ask.** "Implement and commit", "plan, implement, review, then commit", or a plain "commit this" is the approval — do it, don't ask again. Absent any such signal, finish the work, leave it staged or unstaged as found, and suggest a concise commit message as text. One logical change per commit, conventional-commit subject (`fix(ui): ...`), imperative, no trailing period.
 - **Never push**, tag, or create branches unless the user explicitly asks.
 - Never run history- or worktree-destroying commands: `git reset --hard`, `git checkout .`, `git clean -fd`, `git stash`, `git add -A`, `git add .`, `git commit --no-verify`, or any force push.
 - Leave the working tree as the user left it — don't stage, stash, or revert files you didn't change.
