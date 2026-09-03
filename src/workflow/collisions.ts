@@ -10,11 +10,14 @@
  *
  * ## What counts as a conflict
  *
- * An exact name match against {@link FOREIGN_WORKFLOW_TOOL_NAMES}, from a tool
- * that is not ours. Exact and not a substring on purpose: `Workflow` is a
- * common word in tool names that have nothing to do with orchestration
+ * A case-insensitive exact name match against {@link FOREIGN_WORKFLOW_TOOL_NAMES},
+ * from a tool that is not ours. Exact and not a substring on purpose: `Workflow`
+ * is a common word in tool names that have nothing to do with orchestration
  * (`github_workflow_run`, `list_workflows`), and silently disabling the feature
- * against one of those would be a bug nobody could see.
+ * against one of those would be a bug nobody could see. Case-insensitive because
+ * tool names aren't a controlled vocabulary: pi-dynamic-workflows, a real second
+ * orchestrator this check exists to catch, registers its tool as `workflow`
+ * (lowercase) rather than `Workflow`.
  *
  * Two shapes, both decided here:
  *
@@ -53,6 +56,11 @@ export const FOREIGN_WORKFLOW_TOOL_NAMES: ReadonlySet<string> = new Set([
   "Workflow",
 ]);
 
+/** Lowercased mirror of {@link FOREIGN_WORKFLOW_TOOL_NAMES} for case-insensitive matching. */
+const FOREIGN_WORKFLOW_TOOL_NAMES_LOWER: ReadonlySet<string> = new Set(
+  [...FOREIGN_WORKFLOW_TOOL_NAMES].map(name => name.toLowerCase()),
+);
+
 /** The fields of a registered tool this decision reads. */
 export interface RegisteredToolInfo {
   name: string;
@@ -90,12 +98,12 @@ export function decideWorkflowCollision(input: {
   pinned: boolean;
 }): WorkflowCollision {
   const foreign = input.tools.find(
-    tool => FOREIGN_WORKFLOW_TOOL_NAMES.has(tool.name) && tool.description !== input.ownDescription,
+    tool => FOREIGN_WORKFLOW_TOOL_NAMES_LOWER.has(tool.name.toLowerCase()) && tool.description !== input.ownDescription,
   );
   if (foreign === undefined) return { kind: "none" };
 
   const source = foreign.sourceInfo?.source ?? "unknown source";
-  const tookOurName = foreign.name === SUBAGENT_TOOL_NAMES.WORKFLOW;
+  const tookOurName = foreign.name.toLowerCase() === SUBAGENT_TOOL_NAMES.WORKFLOW.toLowerCase();
 
   if (input.pinned) {
     if (!tookOurName) return { kind: "none" };
