@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **Workflow-tool collision detection is now case-insensitive.** `decideWorkflowCollision` matched a foreign tool's name against `FOREIGN_WORKFLOW_TOOL_NAMES` exactly, but `pi-dynamic-workflows` — a real second orchestrator this check exists to catch — registers its tool as `workflow` (lowercase), not `Workflow`. With both extensions loaded, this extension never detected the other's tool and never stood down, so a session ended up with both `SubagentWorkflow` and `workflow` offered to the model at once — the exact outcome the collision check exists to prevent. The name comparison is now case-insensitive on both sides (the foreign-name lookup and the took-our-name check), while staying an exact match rather than a substring one.
+- **The workflow stand-down now recognises a lowercase `workflow` tool** ([#283](https://github.com/tintinweb/pi-subagents/issues/283) — thanks [@zampierilucas](https://github.com/zampierilucas)). The match is exact on purpose, and the set held `Workflow` and `SubagentWorkflow` only, so `@quintinshaw/pi-dynamic-workflows` — which registers lowercase `workflow` — never tripped it: with `workflowsEnabled` unset, both orchestrators reached the model and nothing warned. Adding the third name is the whole fix; exactness is kept, so a `list_workflows` still cannot take the feature down.
 
 ## [0.19.0] - 2026-08-25
 

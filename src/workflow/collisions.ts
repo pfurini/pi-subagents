@@ -49,7 +49,9 @@ import { SUBAGENT_TOOL_NAMES } from "../agent-runner.js";
  *
  * Our own name, because pi resolves a duplicate registration silently, and
  * Claude Code's bare `Workflow`, because a port of that tool is what a second
- * workflow extension most likely calls itself.
+ * workflow extension most likely calls itself. Casing here is arbitrary — the
+ * {@link FOREIGN_WORKFLOW_TOOL_NAMES_LOWER} mirror below is what the match
+ * actually reads, so each name only needs to appear once.
  */
 export const FOREIGN_WORKFLOW_TOOL_NAMES: ReadonlySet<string> = new Set([
   SUBAGENT_TOOL_NAMES.WORKFLOW,
