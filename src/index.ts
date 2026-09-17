@@ -10,6 +10,7 @@
  *   /agents                 — Interactive agent management menu
  */
 
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
@@ -495,24 +496,68 @@ export default function (pi: ExtensionAPI) {
   // Holds notifications briefly so get_subagent_result can cancel them
   // before they reach pi.sendMessage (fire-and-forget).
   const pendingNudges = new Map<string, ReturnType<typeof setTimeout>>();
+  const queuedNudges = new Set<string>();
+  const nudgeRecords = new Map<string, AgentRecord[]>();
+  const nudgeSends = new Map<string, () => void>();
+  const nudgeQueueIds = new Map<string, string>();
   const NUDGE_HOLD_MS = 200;
   // A queued result wait must observe completion before its held notification
   // can fire, so successful waits can still suppress that redundant nudge.
   const QUEUE_WAIT_POLL_MS = Math.floor(NUDGE_HOLD_MS / 4);
+  const nudgeQueueId = (key: string): string => {
+    let queueId = nudgeQueueIds.get(key);
+    if (!queueId) {
+      queueId = randomUUID();
+      nudgeQueueIds.set(key, queueId);
+    }
+    return queueId;
+  };
+  type QueueableMessageOptions = { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn"; queueId?: string };
+  const sendQueuedMessage = pi.sendMessage as unknown as (
+    message: Parameters<ExtensionAPI["sendMessage"]>[0],
+    options?: QueueableMessageOptions,
+  ) => void;
 
-  function scheduleNudge(key: string, send: () => void, delay = NUDGE_HOLD_MS) {
+  function cancelQueuedNudge(key: string): void {
+    const remove = (pi as ExtensionAPI & { removeQueuedMessage?: (queueId: string) => boolean }).removeQueuedMessage;
+    const queueId = nudgeQueueIds.get(key);
+    if (queueId) remove?.(queueId);
+    nudgeQueueIds.delete(key);
+    queuedNudges.delete(key);
+  }
+
+  function scheduleNudge(key: string, send: () => void, delay = NUDGE_HOLD_MS, records?: AgentRecord[]): void {
     cancelNudge(key);
+    if (records) nudgeRecords.set(key, records);
+    nudgeSends.set(key, send);
     pendingNudges.set(key, setTimeout(() => {
       pendingNudges.delete(key);
+      queuedNudges.add(key);
       try { send(); } catch { /* ignore stale completion side-effect errors */ }
     }, delay));
   }
 
-  function cancelNudge(key: string) {
+  function cancelNudge(key: string): void {
     const timer = pendingNudges.get(key);
     if (timer != null) {
       clearTimeout(timer);
       pendingNudges.delete(key);
+    }
+    cancelQueuedNudge(key);
+    nudgeRecords.delete(key);
+    nudgeSends.delete(key);
+  }
+
+  function cancelAgentNudge(agentId: string): void {
+    for (const [key, records] of nudgeRecords) {
+      if (!records.some(record => record.id === agentId)) continue;
+      const send = nudgeSends.get(key);
+      const wasQueued = queuedNudges.has(key);
+      const remaining = records.filter(record => !record.resultConsumed);
+      cancelNudge(key);
+      if (send && remaining.length > 0) {
+        scheduleNudge(key, send, wasQueued ? 0 : NUDGE_HOLD_MS, remaining);
+      }
     }
   }
 
@@ -523,19 +568,19 @@ export default function (pi: ExtensionAPI) {
     const notification = formatTaskNotification(record, 500, showCost);
     const footer = record.outputFile ? `\nFull transcript available at: ${record.outputFile}` : '';
 
-    pi.sendMessage<NotificationDetails>({
+    sendQueuedMessage({
       customType: "subagent-notification",
       content: notification + footer,
       display: true,
       details: buildNotificationDetails(record, 500, agentActivity.get(record.id)),
-    }, { deliverAs: "followUp", triggerTurn: true });
+    }, { deliverAs: "followUp", triggerTurn: true, queueId: nudgeQueueId(record.id) });
   }
 
   function sendIndividualNudge(record: AgentRecord) {
     agentActivity.delete(record.id);
     widget.markFinished(record.id);
     fleet.onAgentFinished(record.id);
-    scheduleNudge(record.id, () => emitIndividualNudge(record));
+    scheduleNudge(record.id, () => emitIndividualNudge(record), NUDGE_HOLD_MS, [record]);
     widget.update();
   }
 
@@ -561,13 +606,13 @@ export default function (pi: ExtensionAPI) {
           details.others = rest.map(r => buildNotificationDetails(r, 300, agentActivity.get(r.id)));
         }
 
-        pi.sendMessage<NotificationDetails>({
+        sendQueuedMessage({
           customType: "subagent-notification",
           content: `Background agent group completed: ${label}\n\n${notifications}\n\nUse get_subagent_result for full output.`,
           display: true,
           details,
-        }, { deliverAs: "followUp", triggerTurn: true });
-      });
+        }, { deliverAs: "followUp", triggerTurn: true, queueId: nudgeQueueId(groupKey) });
+      }, NUDGE_HOLD_MS, records);
       widget.update();
     },
     30_000,
@@ -912,7 +957,7 @@ export default function (pi: ExtensionAPI) {
             if (!record || record.parentAgentId) return false;
             if (record.status === "running" || record.status === "queued") return false;
             record.resultConsumed = true;
-            cancelNudge(record.id);
+            cancelAgentNudge(record.id);
             return true;
           },
         },
@@ -1216,8 +1261,8 @@ export default function (pi: ExtensionAPI) {
     for (const task of workflowTasks.values()) task.abortController.abort();
     workflowTasks.clear();
     manager.abortAll();
-    for (const timer of pendingNudges.values()) clearTimeout(timer);
-    pendingNudges.clear();
+    for (const key of pendingNudges.keys()) cancelNudge(key);
+    for (const key of queuedNudges) cancelNudge(key);
     fleet.dispose();
     // Awaited: it emits `session_shutdown` into every retained child session so
     // extensions bound there can release what they armed in `session_start` (#242).
@@ -2920,7 +2965,7 @@ Terse command-style prompts produce shallow, generic work.
       // Mark result as consumed — suppresses the completion notification
       if (record.status !== "running" && record.status !== "queued") {
         record.resultConsumed = true;
-        cancelNudge(params.agent_id);
+        cancelAgentNudge(record.id);
       }
 
       // Verbose: include full conversation

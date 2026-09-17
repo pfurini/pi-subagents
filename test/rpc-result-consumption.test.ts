@@ -59,6 +59,7 @@ function makePi() {
     events: bus,
     appendEntry: vi.fn(),
     sendMessage: vi.fn(),
+    removeQueuedMessage: vi.fn(() => true),
   } as any;
   return { pi, lifecycle, bus };
 }
@@ -150,6 +151,18 @@ describe("subagents:rpc:consume", () => {
 
     expect(notifications(pi)).toHaveLength(1);
   });
+
+	it("removes an already-queued notification when the result is consumed later", async () => {
+		vi.mocked(runAgent).mockResolvedValue({ responseText: "TASK_EXECUTE_AGENT_OK" } as any);
+		const { pi, bus } = await boot();
+
+		const id = await spawnOverRpc(bus, "req-spawn-late-consume");
+		await new Promise(r => setTimeout(r, PAST_THE_HOLD_MS));
+		expect(notifications(pi)).toHaveLength(1);
+
+		bus.emit("subagents:rpc:consume", { requestId: "req-consume-late", agentId: id });
+		expect(pi.removeQueuedMessage).toHaveBeenCalledWith(expect.any(String));
+	});
 
   it("suppresses the notification once the caller consumes the result", async () => {
     vi.mocked(runAgent).mockResolvedValue({ responseText: "TASK_EXECUTE_AGENT_OK" } as any);
