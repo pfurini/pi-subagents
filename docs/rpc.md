@@ -121,8 +121,9 @@ When a background agent finishes, pi-subagents sends the user a completion notif
 |---|---|
 | Synchronously, inside your `subagents:completed` handler | The notification is never parked. This is the clean path |
 | While the parent model is mid-turn, any time before that turn ends | Suppressed. A completion that lands mid-turn is parked and delivered once at `agent_end`, minus every record consumed by then |
-| While the parent is idle, within 200 ms | Suppressed. The notification is held for `NUDGE_HOLD_MS` and re-checked when the hold expires |
-| While the parent is idle, after 200 ms | Too late. The notification has been sent with `triggerTurn: true` and started a turn |
+| While the parent is idle, within the hold (`NUDGE_HOLD_MS`, 200 ms, re-armed on each arrival) | Suppressed. The notification is re-checked when the hold expires |
+| While the parent is idle, after the hold | Too late. The notification has been sent with `triggerTurn: true` and started a turn |
+| After the user interrupted the parent, until its next run starts | Delivered with the next prompt instead of starting a turn; consuming before that prompt still suppresses it |
 
 Fire-and-forget is the intended use: the reply carries nothing to act on, and the channel sits outside the `subagents:rpc:ping` version handshake on purpose (`src/cross-extension-rpc.ts:267-269`), so you can send it unconditionally and an older pi-subagents with no handler simply keeps notifying.
 

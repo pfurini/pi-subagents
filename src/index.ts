@@ -506,7 +506,7 @@ export default function (pi: ExtensionAPI) {
     /** Run identity: a resume clears `completedAt` and reuses the record, which retires this entry. */
     completedAt: number | undefined;
   }
-  interface PendingNotification { records: ParkedRecord[]; partial: boolean }
+  interface PendingNotification { records: ParkedRecord[] }
   const pendingNotifications = new Map<string, PendingNotification>();
   const pendingWorkflowNotifications = new Map<string, (deliverAs: NotificationDelivery) => void>();
   /** True between agent_start and agent_end: the model is mid-turn. */
@@ -535,10 +535,9 @@ export default function (pi: ExtensionAPI) {
       && record.status !== "queued";
   }
 
-  function parkNotification(key: string, records: AgentRecord[], partial: boolean): void {
+  function parkNotification(key: string, records: AgentRecord[]): void {
     pendingNotifications.set(key, {
       records: records.map(record => ({ record, completedAt: record.completedAt })),
-      partial,
     });
     if (!runActive) scheduleIdleFlush();
   }
@@ -564,8 +563,13 @@ export default function (pi: ExtensionAPI) {
       return true;
     });
     if (live.length > 0) {
-      const partial = entries.some(entry => entry.partial && entry.records.some(isLive));
-      const message = buildCompletionNotification(live.map(parked => parked.record), partial);
+      // "Others still running" is judged now, not when a group timer fired: a
+      // partial delivery parked earlier may be joined by the rest of its group
+      // before this flush, and then nothing is running any more.
+      const othersRunning = manager.listAgents().some(record =>
+        isTopLevelAgent(record) && record.isBackground && !seen.has(record.id)
+        && (record.status === "running" || record.status === "queued"));
+      const message = buildCompletionNotification(live.map(parked => parked.record), othersRunning);
       try {
         sendQueuedMessage(message, { deliverAs, triggerTurn: true, discardIf: () => !live.some(isLive) });
       } catch { /* ignore stale completion side-effect errors */ }
@@ -610,17 +614,17 @@ export default function (pi: ExtensionAPI) {
     agentActivity.delete(record.id);
     widget.markFinished(record.id);
     fleet.onAgentFinished(record.id);
-    parkNotification(record.id, [record], false);
+    parkNotification(record.id, [record]);
     widget.update();
   }
 
   // ---- Group join manager ----
   const groupJoin = new GroupJoinManager(
-    (records, partial) => {
+    (records) => {
       for (const r of records) { agentActivity.delete(r.id); widget.markFinished(r.id); fleet.onAgentFinished(r.id); }
 
       const groupKey = `group:${records.map(r => r.id).join(",")}`;
-      parkNotification(groupKey, records, partial);
+      parkNotification(groupKey, records);
       widget.update();
     },
     30_000,
@@ -935,7 +939,9 @@ export default function (pi: ExtensionAPI) {
   // Turn boundaries. A run in flight parks completions (parkNotification); its
   // end delivers them. An aborted run leaves `interrupted` set, so whatever
   // completes before the next prompt is attached to that prompt instead of
-  // starting a turn the user just cancelled.
+  // starting a turn the user just cancelled. A run that ended in a provider
+  // error keeps its completions parked: pi may retry it as a continuation of
+  // the same run, and agent_settled covers the case where no retry follows.
   pi.on("agent_start", () => {
     runActive = true;
     interrupted = false;
@@ -944,11 +950,19 @@ export default function (pi: ExtensionAPI) {
       idleFlushTimer = undefined;
     }
   });
-  pi.on("agent_end", (event) => {
-    runActive = false;
+  pi.on("agent_end", (event, ctx) => {
     const last = event.messages.at(-1);
-    if (last?.role === "assistant" && last.stopReason === "aborted") interrupted = true;
+    // The tail is not always an aborted assistant message: an abort during the
+    // last turn's tool batch can end the run on a tool result, so the run's own
+    // signal is the authoritative sign.
+    if (ctx.signal?.aborted || (last?.role === "assistant" && last.stopReason === "aborted")) interrupted = true;
+    if (!interrupted && last?.role === "assistant" && last.stopReason === "error") return;
+    runActive = false;
     flushPendingNotifications();
+  });
+  pi.on("agent_settled", () => {
+    runActive = false;
+    if (pendingNotifications.size > 0 || pendingWorkflowNotifications.size > 0) scheduleIdleFlush();
   });
 
   // Capture ctx from session_start for RPC spawn handler + start the scheduler.

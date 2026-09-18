@@ -583,7 +583,7 @@ When background agents complete, they notify the main agent. The **join mode** c
 
 **Timeout behavior:** When agents are grouped, a 30-second timeout starts after the first agent completes. If not all agents finish in time, a partial notification is sent with completed results and remaining agents continue with a shorter 15-second re-batch window for stragglers.
 
-**Delivery timing:** a completion that lands while the model is mid-turn is not delivered right away. It is held and delivered once, when that turn ends, consolidated with every other completion that landed during the turn and minus any result the model already fetched with `get_subagent_result` in the meantime. While the model is idle, a completion is delivered after a short hold and starts a turn. After a turn the user interrupted, completions are attached to the next prompt instead of starting a turn.
+**Delivery timing:** a completion that lands while the model is mid-turn is not delivered right away. It is held and delivered once, when that turn ends, consolidated with every other completion that became deliverable during the turn (a group still held by its join timer joins once the timer releases it) and minus any result the model already fetched with `get_subagent_result` in the meantime. While the model is idle, a completion is delivered after a short hold, re-armed while more completions arrive, and starts a turn. After a turn the user interrupted, and until the next turn starts, completions are attached to the next prompt instead of starting a turn.
 
 **Configuration:**
 - Configure join mode in `/agents` → Settings → Join mode

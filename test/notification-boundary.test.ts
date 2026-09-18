@@ -26,7 +26,7 @@ const PAST_THE_HOLD_MS = 400;
 const notifications = (pi: any): any[][] =>
   pi.sendMessage.mock.calls.filter((c: any[]) => c[0]?.customType === "subagent-notification");
 
-const assistant = (stopReason: "stop" | "aborted") => ({ role: "assistant", content: [], stopReason });
+const assistant = (stopReason: "stop" | "aborted" | "error") => ({ role: "assistant", content: [], stopReason });
 
 describe("completion notifications at the turn boundary", () => {
   let hermetic: Hermetic | undefined;
@@ -49,11 +49,16 @@ describe("completion notifications at the turn boundary", () => {
     return booted;
   }
 
+  /** A session stub with what a background resume touches; `prompt` settles when the caller says so. */
+  function fakeSession(prompt: () => Promise<void> = () => Promise.resolve()) {
+    return { dispose: vi.fn(), abort: vi.fn(), subscribe: vi.fn(() => () => {}), messages: [] as unknown[], prompt: vi.fn(prompt) };
+  }
+
   /** Spawn a background agent whose (mocked) run answers `responseText` at once. */
-  async function spawn(b: BootedPi, responseText: string): Promise<string> {
+  async function spawn(b: BootedPi, responseText: string, session: unknown = fakeSession()): Promise<string> {
     vi.mocked(runAgent).mockResolvedValueOnce({
       responseText,
-      session: { dispose: vi.fn() },
+      session,
       aborted: false,
       steered: false,
     } as any);
@@ -103,6 +108,8 @@ describe("completion notifications at the turn boundary", () => {
     expect(message.content).toContain(a);
     expect(message.content).toContain(c);
     expect(options).toMatchObject({ deliverAs: "followUp", triggerTurn: true });
+    // Both agents are done, so the consolidated label must not claim otherwise.
+    expect(message.content).not.toContain("others still running");
     // The queued message can still be dropped at injection: the predicate turns
     // true only once every record it covers has been read.
     expect(options.discardIf()).toBe(false);
@@ -119,6 +126,71 @@ describe("completion notifications at the turn boundary", () => {
     await endRun(b, "aborted");
     expect(notifications(b.pi)).toHaveLength(1);
     expect(notifications(b.pi)[0][1]).toMatchObject({ deliverAs: "nextTurn" });
+  });
+
+  it("treats a run whose signal was aborted as interrupted even when the tail is a tool result", async () => {
+    const b = await boot();
+    startRun(b);
+    await spawn(b, "RESULT-A");
+    await b.lifecycle.get("agent_end")(
+      { type: "agent_end", messages: [{ role: "toolResult", content: [] }] },
+      ctx({ signal: AbortSignal.abort() }),
+    );
+    expect(notifications(b.pi)).toHaveLength(1);
+    expect(notifications(b.pi)[0][1]).toMatchObject({ deliverAs: "nextTurn" });
+  });
+
+  it("keeps completions parked across a provider error that pi retries", async () => {
+    const b = await boot();
+    startRun(b);
+    const id = await spawn(b, "RESULT-A");
+    await b.lifecycle.get("agent_end")({ type: "agent_end", messages: [assistant("error")] }, ctx());
+    await settle();
+    expect(notifications(b.pi)).toHaveLength(0);
+
+    startRun(b); // the retry
+    await endRun(b);
+    expect(notifications(b.pi)).toHaveLength(1);
+    expect(notifications(b.pi)[0][0].content).toContain(id);
+  });
+
+  it("releases completions parked by an errored run once pi settles without a retry", async () => {
+    const b = await boot();
+    startRun(b);
+    await spawn(b, "RESULT-A");
+    await b.lifecycle.get("agent_end")({ type: "agent_end", messages: [assistant("error")] }, ctx());
+    await b.lifecycle.get("agent_settled")({ type: "agent_settled" }, ctx());
+    await settle();
+    expect(notifications(b.pi)).toHaveLength(1);
+    expect(notifications(b.pi)[0][1]).toMatchObject({ deliverAs: "followUp", triggerTurn: true });
+  });
+
+  it("retires a parked completion when its agent is resumed, and announces the new run when it ends", async () => {
+    const b = await boot();
+    let finishResume: () => void = () => {};
+    const session = fakeSession(() => new Promise<void>(resolve => { finishResume = resolve; }));
+    startRun(b);
+    const id = await spawn(b, "RESULT-A", session);
+    expect(textOf(await read(b, id))).toContain("RESULT-A");
+
+    const resumed = await b.tools.get("Agent").execute(
+      "tc-resume",
+      { resume: id, prompt: "again", subagent_type: "general-purpose", run_in_background: true },
+      undefined,
+      undefined,
+      ctx(),
+    );
+    expect(textOf(resumed)).toContain("resumed in background");
+
+    // The first run's record was read; the resume reset it, which must not
+    // resurrect the first run's notification.
+    await endRun(b);
+    expect(notifications(b.pi)).toHaveLength(0);
+
+    finishResume();
+    await settle();
+    expect(notifications(b.pi)).toHaveLength(1);
+    expect(notifications(b.pi)[0][0].content).toContain(id);
   });
 
   it("keeps delivering to the next prompt after an abort until a new turn starts", async () => {
