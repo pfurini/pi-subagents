@@ -44,6 +44,7 @@
     "lint": "biome check src/ test/",
     "lint:fix": "biome check --fix src/ test/",
     "check": "npm run lint && npm run typecheck && npm run test",
+    "check:pi": "node scripts/check-against-pi.mjs",
     "test:coverage": "vitest run --coverage",
     "bench": "vitest bench",
     "bench:ab": "node test/perf/ab.mjs"

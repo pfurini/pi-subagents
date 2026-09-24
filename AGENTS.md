@@ -50,6 +50,7 @@ Read the file that covers a surface before changing its behavior; update it in t
   npm run test        # vitest run
   ```
 - `npm run lint:fix` auto-fixes most style issues.
+- `npm run check:pi` typechecks and tests against a local pi checkout (`../pi`, or `PI_CHECKOUT=<dir>`), which must be built. It is not part of `npm run check`. Run it after any change that touches pi APIs, and before a release. `npm run check:pi -- <file>` limits vitest to one file.
 - `npm run test` runs the whole suite, including `*-e2e.test.ts` files. To iterate on a single file, run it directly: `npx vitest run test/<file>.test.ts`.
 - If you create or modify a test file, run it and iterate on the test or implementation until it passes.
 - `npm run build` compiles with `tsc`; run it only when verifying the build output or when requested.
@@ -139,6 +140,7 @@ Before a release:
   npm run check                    # lint + typecheck + test
   npm run test:e2e                 # faux/scripted e2e — no network, no keys
   npm run build
+  npm run check:pi
   ```
 - For a real pre-publish smoke test, run the **live** e2e against an actual model:
   ```bash
