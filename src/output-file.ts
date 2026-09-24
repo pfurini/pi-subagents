@@ -104,17 +104,26 @@ export function streamToOutputFile(
   cwd: string,
   startIndex?: number,
 ): () => void {
-  // Index of the first message this stream is responsible for. A spawn writes
-  // messages[0] as the initial prompt entry, so it starts at 1. A resume hands
+  // Index of the first message this stream is responsible for. A resume hands
   // in the session's length as of just before the run: the session already
   // holds every prior turn, and re-emitting those would duplicate history that
-  // is already in the file.
-  let writtenCount = startIndex ?? 1;
+  // is already in the file. A spawn starts at 0 and skips its first user
+  // message instead, because `writeInitialEntry` already wrote the prompt. The
+  // index cannot be fixed at 1: since pi 0.86 the first message is the system
+  // message, not the prompt.
+  let writtenCount = startIndex ?? 0;
+  let skipInitialPrompt = startIndex === undefined;
 
   const flush = () => {
     const messages = session.messages;
     while (writtenCount < messages.length) {
-      const msg = messages[writtenCount];
+      const msg = messages[writtenCount++];
+      // System messages carry the prompt and tool declarations, not conversation.
+      if (msg.role === "system") continue;
+      if (skipInitialPrompt && msg.role === "user") {
+        skipInitialPrompt = false;
+        continue;
+      }
       const entry = {
         isSidechain: true,
         agentId,
@@ -126,7 +135,6 @@ export function streamToOutputFile(
       try {
         appendFileSync(path, JSON.stringify(entry) + "\n", "utf-8");
       } catch { /* ignore write errors */ }
-      writtenCount++;
     }
   };
 

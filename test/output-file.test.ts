@@ -102,6 +102,39 @@ describe("streamToOutputFile", () => {
       .map((line) => JSON.parse(line));
   }
 
+  it("skips system messages and the already-written prompt (pi >= 0.86 message order)", () => {
+    const session = makeFakeSession([
+      { role: "system", content: "prompt and tool declarations" },
+      { role: "user", content: "do the thing" },
+    ]);
+    streamToOutputFile(session as never, outPath, "agent-1", "/work");
+
+    session.push(
+      { role: "assistant", content: [{ type: "text", text: "ok" }] },
+      { role: "system", content: "", toolsAdded: [{ name: "late_tool" }] },
+      { role: "toolResult", content: [{ type: "text", text: "x" }] },
+    );
+    session.fire({ type: "turn_end" });
+
+    const entries = readEntries();
+    expect(entries.map((e) => e.type)).toEqual(["user", "assistant", "toolResult"]);
+    expect(entries.some((e) => (e.message as { role?: string }).role === "system")).toBe(false);
+  });
+
+  it("writes a resumed run's prompt, which no initial entry covers", () => {
+    const session = makeFakeSession([
+      { role: "system", content: "p" },
+      { role: "user", content: "do the thing" },
+      { role: "assistant", content: [{ type: "text", text: "first answer" }] },
+    ]);
+    streamToOutputFile(session as never, outPath, "agent-1", "/work", 3);
+
+    session.push({ role: "user", content: "and again" }, { role: "assistant", content: [{ type: "text", text: "second" }] });
+    session.fire({ type: "turn_end" });
+
+    expect(readEntries().map((e) => e.type)).toEqual(["user", "user", "assistant"]);
+  });
+
   it("writes nothing past the initial entry until turn_end fires", () => {
     const session = makeFakeSession([{ role: "user", content: "do the thing" }]);
     streamToOutputFile(session as never, outPath, "agent-1", "/work");

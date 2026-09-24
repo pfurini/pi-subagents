@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`@agent` mentions in `model` mode start the agent from the conversation again on pi 0.87.** The clone assigned a system prompt that pi 0.87 made read-only, so every mention fell back to a direct start with a warning. The clone is now one off-screen model request carrying the conversation and system prompt pi itself would send, with the `Agent` tool as the only tool.
 - **Finished subagents no longer keep watching files on pi builds with live resource reloading.** Each run now disposes its resource loader when it ends. Before, every finished subagent kept its directory watchers, and each write in the agent directory rescanned skills and commands once per finished agent.
 - **The turn-limit wrap-up message reaches the agent on its next turn again.** Since pi 0.86, `steer()` waits for every extension `input` handler before queueing. The wrap-up could therefore miss its turn, and with a slow handler the agent was hard-aborted without ever seeing it. It is now queued on the agent directly.
+- **Subagent transcripts no longer repeat the initial prompt or record system messages.** Since pi 0.86 a session's first message is the system message, so the writer's fixed starting offset re-wrote the prompt. System messages carry prompt and tool metadata, and the transcript now skips them.
 
 ## [0.19.0] - 2026-08-25
 
