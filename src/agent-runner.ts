@@ -642,11 +642,44 @@ function defaultProjectSessionDir(cwd: string, agentDir: string): string {
   return join(agentDir, "sessions", safePath);
 }
 
+/**
+ * Stop a subagent loader's resource watchers. Pi builds that watch skill and
+ * command directories (`DefaultResourceLoader.dispose`) leave a caller-built
+ * loader to its caller, and a finished run no longer needs live reloads.
+ * Optional because pi 0.87.x as published has no `dispose`.
+ */
+function disposeLoader(loader: DefaultResourceLoader): void {
+  try {
+    (loader as { dispose?: () => void }).dispose?.();
+  } catch {
+    /* a failed teardown must not replace the run's own outcome */
+  }
+}
+
 export async function runAgent(
   ctx: ExtensionContext,
   type: SubagentType,
   prompt: string,
   options: RunOptions,
+): Promise<RunResult> {
+  // Disposed when the run settles, whichever way: the session stays usable
+  // for a later resume, which does not need live skill reloads.
+  let loader: DefaultResourceLoader | undefined;
+  try {
+    return await runAgentWithLoader(ctx, type, prompt, options, (created) => {
+      loader = created;
+    });
+  } finally {
+    if (loader) disposeLoader(loader);
+  }
+}
+
+async function runAgentWithLoader(
+  ctx: ExtensionContext,
+  type: SubagentType,
+  prompt: string,
+  options: RunOptions,
+  onLoader: (loader: DefaultResourceLoader) => void,
 ): Promise<RunResult> {
   const config = getConfig(type);
   const agentConfig = getAgentConfig(type);
@@ -792,6 +825,7 @@ export async function runAgent(
     systemPromptOverride: () => systemPrompt,
     appendSystemPromptOverride: () => [],
   });
+  onLoader(loader);
   await runInChildSessionContext(() => loader.reload());
 
   // Plain entries in `tools:` are expected to be built-in names (extension tools

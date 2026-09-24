@@ -6,6 +6,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const {
   createAgentSession,
   defaultResourceLoaderCtor,
+  loaderDispose,
+  loaderShape,
   loaderExtensionsRef,
   getAgentDir,
   sessionManagerInMemory,
@@ -16,6 +18,9 @@ const {
 } = vi.hoisted(() => ({
   createAgentSession: vi.fn(),
   defaultResourceLoaderCtor: vi.fn(),
+  loaderDispose: vi.fn(),
+  // Published pi 0.87.x has no DefaultResourceLoader.dispose; builds that watch resources do.
+  loaderShape: { hasDispose: true },
   loaderExtensionsRef: {
     current: { extensions: [], errors: [], runtime: {} } as {
       extensions: Array<{ path: string; tools: Map<string, unknown> }>;
@@ -44,6 +49,7 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
     constructor(options: any) {
       this.opts = options;
       defaultResourceLoaderCtor(options);
+      if (loaderShape.hasDispose) (this as { dispose?: () => void }).dispose = loaderDispose;
     }
 
     async reload() {
@@ -202,6 +208,8 @@ const pi = {} as any;
 
 beforeEach(() => {
   createAgentSession.mockReset();
+  loaderDispose.mockReset();
+  loaderShape.hasDispose = true;
   defaultResourceLoaderCtor.mockClear();
   getAgentDir.mockClear();
   sessionManagerInMemory.mockClear();
@@ -2814,5 +2822,50 @@ describe("resolveDefaultModel", () => {
 
   it("returns undefined when neither a config model nor a parent model exists", () => {
     expect(resolveDefaultModel(undefined, registry([haiku]), undefined)).toBeUndefined();
+  });
+});
+
+describe("agent-runner loader lifecycle", () => {
+  // A loader's resource watchers outlive the run unless runAgent disposes it:
+  // pi leaves a caller-built loader to its caller.
+  it("disposes the loader once the run completes", async () => {
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    session.prompt.mockImplementation(async () => {
+      expect(loaderDispose).not.toHaveBeenCalled();
+      session.messages.push({ role: "assistant", content: [{ type: "text", text: "OK" }] });
+    });
+    await runAgent(ctx, "Explore", "go", { pi });
+    expect(loaderDispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("disposes the loader when the session cannot be built", async () => {
+    createAgentSession.mockRejectedValue(new Error("no model"));
+    await expect(runAgent(ctx, "Explore", "go", { pi })).rejects.toThrow("no model");
+    expect(loaderDispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("disposes the loader when the prompt rejects", async () => {
+    const { session } = createSession("OK");
+    session.prompt.mockRejectedValue(new Error("provider down"));
+    createAgentSession.mockResolvedValue({ session });
+    await expect(runAgent(ctx, "Explore", "go", { pi })).rejects.toThrow("provider down");
+    expect(loaderDispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("runs on a pi whose loader has no dispose", async () => {
+    loaderShape.hasDispose = false;
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    await expect(runAgent(ctx, "Explore", "go", { pi })).resolves.toMatchObject({ responseText: "OK" });
+  });
+
+  it("keeps the run's result when dispose throws", async () => {
+    loaderDispose.mockImplementation(() => {
+      throw new Error("watcher already closed");
+    });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    await expect(runAgent(ctx, "Explore", "go", { pi })).resolves.toMatchObject({ responseText: "OK" });
   });
 });
