@@ -1064,23 +1064,17 @@ async function runAgentWithLoader(
         })
       : SessionManager.inMemory(effectiveCwd);
 
-  // Pi 0.80.8 replaced createAgentSession's modelRegistry option with
-  // modelRuntime, but ExtensionContext still exposes only the registry facade.
-  // Pass both so the full supported Pi range retains the parent's providers.
+  // The child must reach the parent's providers, including ones extensions
+  // registered at runtime. ExtensionContext exposes only the registry facade,
+  // whose private `runtime` field is the ModelRuntime createAgentSession takes.
+  // `as never`: an opaque value read off a private field cannot satisfy the
+  // ModelRuntime type.
   const parentModelRuntime = (ctx.modelRegistry as unknown as { runtime?: unknown }).runtime;
-  const sessionOpts: Parameters<typeof createAgentSession>[0] & {
-    modelRegistry: ExtensionContext["modelRegistry"];
-    modelRuntime?: unknown;
-  } = {
+  const sessionOpts: Parameters<typeof createAgentSession>[0] = {
     cwd: effectiveCwd,
     agentDir,
     sessionManager,
     settingsManager,
-    modelRegistry: ctx.modelRegistry,
-    // `as never` is what keeps this assignable across the supported Pi range:
-    // pre-0.80.8 the field exists only via the `modelRuntime?: unknown` shim
-    // above, while newer Pi types it as `ModelRuntime` — a shape an opaque
-    // `unknown` read off the private facade field can never satisfy.
     ...(parentModelRuntime !== undefined && { modelRuntime: parentModelRuntime as never }),
     model,
     tools: sessionTools,

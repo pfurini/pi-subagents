@@ -3,17 +3,14 @@
  * in one place.
  *
  * `registerFauxProvider` scripts the *responses*, but a session still has to get
- * past model lookup and auth before it streams anything, and where that check
- * lives moved with Pi 0.80.8:
- *   - Pi < 0.80.8: `createAgentSession({ modelRegistry })`, auth via
- *     `getApiKeyAndHeaders()`.
- *   - Pi >= 0.80.8: `createAgentSession({ modelRuntime })` — the registry option
- *     is gone entirely — auth via `getAuth()`/`hasConfiguredAuth()`, and the
- *     turn itself streams through `modelRuntime.streamSimple`.
+ * past model lookup and auth before it streams anything.
+ * `createAgentSession` takes `modelRuntime`; the turn itself streams through
+ * `modelRuntime.streamSimple`. `modelRegistry` stands in for
+ * `ExtensionContext.modelRegistry` in code under test: model lookup, auth
+ * checks, and `streamSimple` for the mention clone's one request.
  *
- * Passing BOTH spans the supported range: each Pi ignores the option it no
- * longer knows. Structural fakes (not real instances) keep the suites hermetic —
- * no auth.json, no network, no local login state.
+ * Structural fakes (not real instances) keep the suites hermetic: no
+ * auth.json, no network, no local login state.
  */
 import type { Model } from "@earendil-works/pi-ai";
 import { streamSimple } from "./pi-ai.js";

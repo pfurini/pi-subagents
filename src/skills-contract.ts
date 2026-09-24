@@ -14,7 +14,7 @@
  *     `SkillAgentRewriteMap`, `SkillAgentRewriteMaps`, `SkillAgentRewriteMapsEvent`).
  *
  * These are NEVER imported from `@earendil-works/pi-coding-agent`: the published
- * upstream package (0.84.x) does not ship these modules, so an import would break
+ * upstream package (0.87.x) does not ship these modules, so an import would break
  * this repo's independent build. Under upstream pi with no seam, the skill-agents
  * feature simply degrades to nothing. `test/skills-contract.test.ts` pins the copy
  * against core's source when the checkout is present.

@@ -18,47 +18,24 @@
  * exposes a runtime-reachable `.runtime` that IS the runtime it wraps. It is not a
  * guard for the forwarding itself (that's the unit test's job) — a fuller e2e that
  * drives real `runAgent` end-to-end is tracked as a follow-up.
- *
- * VERSION GATE: `.runtime` only exists in the post-migration facade world (Pi >=
- * 0.80.8, where `ModelRuntime` is first exported). The repo's dev dependency is
- * pinned post-migration, so this runs by default — but it stays gated because CI
- * also runs the suite against the peer-range floor (see .github/workflows/ci.yml),
- * where Pi predates the migration. There we DYNAMICALLY import Pi and skip
- * cleanly; a static `import { ModelRuntime }` would be a link-time error.
  */
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { afterAll, describe, expect, it } from "vitest";
-
-// Dynamic, so this file LOADS on pre-migration Pi (a static `import { ModelRuntime }`
-// would be a link-time error there — 0.80.6 doesn't export it).
-const pi = (await import("@earendil-works/pi-coding-agent")) as Record<string, unknown>;
-const ModelRuntime = pi.ModelRuntime as
-  | { create(opts?: Record<string, unknown>): Promise<ModelRuntimeLike> }
-  | undefined;
-
-// The migration is exactly "ModelRuntime now exists". Absent ⇒ pre-0.80.8 ⇒ there
-// is no `.runtime` facade to guard.
-const MIGRATED = typeof ModelRuntime?.create === "function";
-const RT = ModelRuntime as { create(opts?: Record<string, unknown>): Promise<ModelRuntimeLike> };
-
-// The one method the reach scenario needs; `.runtime` itself is private (reached below).
-interface ModelRuntimeLike {
-  registerProvider(id: string, config: Record<string, unknown>): void;
-}
 
 const tmpDirs: string[] = [];
 afterAll(() => {
   for (const d of tmpDirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
-describe.skipIf(!MIGRATED)("PR #152 reach: real ModelRegistry exposes .runtime (Pi >= 0.80.8)", () => {
+describe("PR #152 reach: real ModelRegistry exposes .runtime", () => {
   it("ctx.modelRegistry.runtime is reachable and IS the runtime it wraps", async () => {
     // A real, configured runtime — as an extension leaves it after registerProvider.
     const dir = mkdtempSync(join(tmpdir(), "iso-prov-"));
     tmpDirs.push(dir);
-    const runtime = await RT.create({
+    const runtime = await ModelRuntime.create({
       authPath: join(dir, "auth.json"),
       modelsPath: join(dir, "models.json"),
       allowModelNetwork: false,
@@ -71,7 +48,7 @@ describe.skipIf(!MIGRATED)("PR #152 reach: real ModelRegistry exposes .runtime (
     const indexUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
     const mrUrl = indexUrl.replace(/index\.js$/, "core/model-registry.js");
     const { ModelRegistry } = (await import(mrUrl)) as {
-      ModelRegistry: new (rt: ModelRuntimeLike) => { runtime?: unknown };
+      ModelRegistry: new (rt: ModelRuntime) => { runtime?: unknown };
     };
 
     const facade = new ModelRegistry(runtime);
