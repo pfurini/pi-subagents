@@ -129,6 +129,7 @@ describe("a finished subagent stays resumable after its loader is disposed", () 
     let agentId: string | undefined;
     const childUserTurns: number[] = [];
     const run = await runPrintMode({
+      live: false, // scripted on purpose: a real model would not follow the script
       prompt: "go",
       maxModelCalls: 12,
       respond: (context) => {

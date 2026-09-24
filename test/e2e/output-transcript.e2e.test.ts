@@ -22,6 +22,7 @@ describe("subagent transcript over a real session", () => {
     const cwd = mkdtempSync(join(tmpdir(), "subagents-transcript-"));
     let childCalls = 0;
     const run = await runPrintMode({
+      live: false, // scripted on purpose: a real model would not follow the script
       cwd,
       prompt: "go",
       respond: routeBySession({

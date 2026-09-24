@@ -29,6 +29,7 @@ describe("turn-limit wrap-up with a slow child input handler", () => {
     (globalThis as unknown as Record<symbol, unknown>)[SEEN] = [];
     const childSawWrapUp: boolean[] = [];
     const run = await runPrintMode({
+      live: false, // scripted on purpose: a real model would not follow the script
       prompt: "go",
       maxModelCalls: 24,
       beforeRun: () => {
