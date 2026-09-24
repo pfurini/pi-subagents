@@ -27,8 +27,8 @@
  * against a Pi that does not aggregate, this fails rather than skipping, which
  * is how the range stays honest. `peerDependencies` moved to `>=0.81.0` for
  * exactly this reason, so the CI floor job runs it too. The floor has since moved
- * on past it (the Workflow tool needs 0.84.0), so this no longer pins the range's
- * lower edge — it still pins the behaviour that made 0.80.x unsupportable.
+ * on past it (to 0.87.0), so this no longer pins the range's lower edge. It
+ * still pins the behaviour that made 0.80.x unsupportable.
  */
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -115,21 +115,25 @@ describe("subagent usage reaches the parent session's stats (real pi)", () => {
   });
 
   it("leaves the context-window percentage alone", async () => {
-    // pi derives context usage from assistant messages only. If that ever
-    // changed, a delegating session would look like it was filling its context
-    // with work that happened somewhere else entirely — and users would compact
-    // for no reason.
-    const session = await realSession();
+    // The reported usage must never count as context. If it did, a delegating
+    // session would look like it was filling its context with work that happened
+    // somewhere else entirely, and users would compact for no reason. Since pi
+    // 0.87 the tool result's own text is estimated into context usage, so the
+    // control is the same tool result without usage, not an unchanged percentage.
+    const withUsage = await realSession();
+    const withoutUsage = await realSession();
     try {
-      const before = session.getSessionStats().contextUsage?.percent ?? null;
-
       const pool = new PendingUsagePool();
       pool.add({ input: 150_000, output: 400, cacheWrite: 100, cost: 1.5 });
-      session.sessionManager.appendMessage(toolResultCarrying(pool.drain()) as any);
+      withUsage.sessionManager.appendMessage(toolResultCarrying(pool.drain()) as any);
+      withoutUsage.sessionManager.appendMessage(toolResultCarrying(undefined) as any);
 
-      expect(session.getSessionStats().contextUsage?.percent ?? null).toBe(before);
+      expect(withUsage.getSessionStats().contextUsage?.percent ?? null).toBe(
+        withoutUsage.getSessionStats().contextUsage?.percent ?? null,
+      );
     } finally {
-      session.dispose?.();
+      withUsage.dispose?.();
+      withoutUsage.dispose?.();
     }
   });
 

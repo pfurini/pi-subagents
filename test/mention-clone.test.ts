@@ -1,401 +1,192 @@
 /**
- * mention-clone.test.ts — the off-screen conversation clone that starts a
- * mentioned agent.
- *
- * Everything here guards one property: the clone is a throwaway, but the agent
- * it starts must be indistinguishable from one the main model launched. That
- * breaks in quiet ways — a spawn attributed to the fork's session id files its
- * transcript in the wrong place, a tool-call id the real session never issued
- * puts a dangling `<tool-use-id>` in the completion notification. Neither
- * surfaces as an error, so each is pinned below.
- *
- * The other half is the fallback contract: `runMentionClone` never rejects,
- * because the caller starts the agent directly on `spawned: false` and a
- * rejection would instead lose the mention entirely.
+ * mention-clone.test.ts — the clone's one request and what it does with the
+ * reply. The model call is stubbed at `ctx.modelRegistry.streamSimple`; pi's
+ * own `convertToLlm` and pi-ai's transcript and validation helpers are real.
+ * test/e2e/mention-clone.e2e.test.ts runs the same path over a real session.
  */
+import {
+  type AssistantMessage,
+  fauxAssistantMessage,
+  fauxText,
+  fauxToolCall,
+  getCurrentSystemPrompt,
+  getCurrentTools,
+  type Message,
+} from "@earendil-works/pi-ai";
+import { Type } from "@sinclair/typebox";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-
-// Hoisted: vi.mock's factory is lifted above the imports, so it cannot close
-// over ordinary top-level consts.
-const { buildSessionContext, createAgentSession, inMemory } = vi.hoisted(() => ({
-  buildSessionContext: vi.fn(),
-  createAgentSession: vi.fn(),
-  inMemory: vi.fn(),
-}));
-
-vi.mock("@earendil-works/pi-coding-agent", async () => {
-  const actual = await vi.importActual<any>("@earendil-works/pi-coding-agent");
-  return {
-    ...actual,
-    buildSessionContext,
-    createAgentSession,
-    SessionManager: { ...actual.SessionManager, inMemory },
-  };
-});
-
 import { agentMentionReminder } from "../src/mention.js";
 import { runMentionClone } from "../src/mention-clone.js";
 
-/** One user turn and its reply, as buildSessionContext resolves them. */
-const CONVERSATION = [
-  { role: "user", content: [{ type: "text", text: "hi" }] },
-  { role: "assistant", content: [{ type: "text", text: "hello" }] },
-] as any[];
+const readTool = { name: "read", description: "read a file", parameters: Type.Object({ path: Type.String() }) };
+const agentDeclaration = {
+  name: "Agent",
+  description: "start an agent",
+  parameters: Type.Object({
+    prompt: Type.String(),
+    description: Type.String(),
+    subagent_type: Type.Optional(Type.String()),
+    run_in_background: Type.Optional(Type.Boolean()),
+  }),
+};
+
+/** The parent's projection: a system message, then one exchange. */
+const PROJECTION = [
+  { role: "system", content: "PARENT PROMPT", toolsAdded: [readTool, agentDeclaration], timestamp: 1 },
+  { role: "user", content: [{ type: "text", text: "earlier question" }], timestamp: 2 },
+  { role: "assistant", content: [{ type: "text", text: "earlier answer" }], stopReason: "stop", timestamp: 3 },
+  { role: "compactionSummary", summary: "what happened before", tokensBefore: 10, timestamp: 4 },
+];
+
+const agentCallReply = (args: Record<string, unknown>, ...more: AssistantMessage["content"]) =>
+  fauxAssistantMessage([fauxToolCall("Agent", args), ...more], { stopReason: "toolUse" });
+const validArgs = { prompt: "written from context", description: "look", subagent_type: "Explore" };
+
+let reply: AssistantMessage;
+let streamSimple: ReturnType<typeof vi.fn>;
+let agentTool: any;
+let ctx: any;
 
 beforeEach(() => {
-  createAgentSession.mockReset();
-  inMemory.mockReset();
-  inMemory.mockReturnValue({ kind: "in-memory-session-manager" } as any);
-  buildSessionContext.mockReset();
-  buildSessionContext.mockReturnValue({ messages: CONVERSATION, thinkingLevel: "high", model: null } as any);
+  reply = agentCallReply(validArgs);
+  streamSimple = vi.fn(() => ({ result: async () => reply }));
+  agentTool = {
+    ...agentDeclaration,
+    label: "Agent",
+    execute: vi.fn(async () => ({ content: [{ type: "text", text: "started" }], details: undefined })),
+  };
+  ctx = {
+    cwd: "/work",
+    model: { provider: "p", id: "m" },
+    thinkingLevel: "high",
+    modelRegistry: { streamSimple },
+    sessionManager: {
+      buildSessionProjection: vi.fn(() => ({ entries: [], messages: PROJECTION })),
+      getSessionId: () => "parent-session",
+    },
+  };
 });
 
-/** The main session's context — the one the spawn must be attributed to. */
-function mainCtx(overrides: Record<string, unknown> = {}) {
-  return {
-    cwd: "/repo",
-    model: { id: "main-model" },
-    thinkingLevel: "high",
-    modelRegistry: { runtime: { kind: "runtime" } },
-    getSystemPrompt: vi.fn(() => "the live system prompt"),
-    sessionManager: {
-      getEntries: vi.fn(() => [{ type: "message" }] as any[]),
-      getLeafId: vi.fn(() => "leaf-1"),
-    },
-    ...overrides,
-  } as any;
-}
+const clone = () => runMentionClone({ ctx, type: "Explore", message: "check the RPC path", agentTool });
+const sentMessages = (): Message[] => streamSimple.mock.calls[0][1].messages;
 
-/** The registered Agent tool, whose handler the clone is supposed to reuse. */
-function agentTool() {
-  return {
-    name: "Agent",
-    execute: vi.fn(async () => ({ content: [{ type: "text", text: "Agent ID: a1" }], details: {} })),
-  } as any;
-}
-
-/**
- * Pi's own tool-visibility rule, reproduced from `sdk.js` + `agent-session.js`:
- * an allowlist is derived once (`tools`, or the empty list when `noTools:
- * "all"`), and EVERY tool — built-in, extension and custom alike — is dropped
- * from the registry unless the allowlist names it. So `noTools: "all"` does not
- * mean "no built-ins, keep my custom tool": it means the clone is handed
- * nothing, answers in prose, and the mention falls back to a direct start.
- */
-function visibleTools(opts: any): any[] {
-  const allowed = opts.tools ?? (opts.noTools === "all" ? [] : undefined);
-  const allowedSet = allowed ? new Set<string>(allowed) : undefined;
-  const excluded = new Set<string>(opts.excludeTools ?? []);
-  return (opts.customTools ?? []).filter(
-    (tool: any) => (!allowedSet || allowedSet.has(tool.name)) && !excluded.has(tool.name),
-  );
-}
-
-/**
- * Stand in for `createAgentSession`. `turn` receives the clone's single custom
- * tool and plays the part of the model deciding what to do with it — and only
- * the tools Pi would really expose reach it, so a clone built with an allowlist
- * that hides its own tool prompts a model with nothing to call.
- */
-function cloneSession(turn?: (tool: any) => Promise<void> | void) {
-  const session = {
-    agent: { state: { systemPrompt: "rebuilt-from-cwd", messages: [] as any[] } },
-    prompt: vi.fn(async () => {}),
-    dispose: vi.fn(),
-  } as any;
-  createAgentSession.mockImplementation(async (opts: any) => {
-    const tools = visibleTools(opts);
-    session.prompt.mockImplementation(async () => {
-      // No tool, no tool call: the model can only answer in prose.
-      if (tools.length === 0) return;
-      await turn?.(tools[0]);
-    });
-    session.createdWith = opts;
-    return { session };
-  });
-  return session;
-}
-
-/** What the model does when it plays along: one Agent call. */
-const callsAgent = (params: Record<string, unknown> = { subagent_type: "Explore", prompt: "go" }) =>
-  async (tool: any) => {
-    await tool.execute("clone-tool-call-1", params, undefined, undefined, { cwd: "/fork" });
-  };
-
-const opts = (over: Record<string, unknown> = {}) => ({
-  ctx: mainCtx(),
-  type: "Explore",
-  message: "find the flaky test",
-  agentTool: agentTool(),
-  ...over,
-}) as any;
-
-describe("cloning the conversation", () => {
-  it("carries the conversation's own messages, not a rendering of them", async () => {
-    // The whole point: the copy reasons over what the main model can see.
-    const session = cloneSession(callsAgent());
-
-    await runMentionClone(opts());
-
-    expect(session.agent.state.messages).toEqual([
-      { role: "user", content: [{ type: "text", text: "hi" }] },
-      { role: "assistant", content: [{ type: "text", text: "hello" }] },
-    ]);
+describe("the clone's request", () => {
+  it("is exactly one call", async () => {
+    await clone();
+    expect(streamSimple).toHaveBeenCalledTimes(1);
   });
 
-  it("takes the conversation from memory, never from the session file", async () => {
-    // SessionManager withholds every write until the first assistant message,
-    // so a file-based copy is empty for the whole of the first turn — which is
-    // exactly when someone types their first mention.
-    const o = opts();
-    cloneSession(callsAgent());
-
-    await runMentionClone(o);
-
-    expect(buildSessionContext).toHaveBeenCalledWith([{ type: "message" }], "leaf-1");
-    expect(createAgentSession.mock.calls[0][0].sessionManager).toEqual({
-      kind: "in-memory-session-manager",
-    });
+  it("carries the conversation pi would send, compaction summary included", async () => {
+    await clone();
+    const texts = sentMessages()
+      .filter((m) => m.role === "user" || m.role === "assistant")
+      .map((m) => JSON.stringify(m.content));
+    expect(texts[0]).toContain("earlier question");
+    expect(texts[1]).toContain("earlier answer");
+    expect(texts[2]).toContain("what happened before");
   });
 
-  it("thinks at the level the session is really on", async () => {
-    cloneSession(callsAgent());
-
-    await runMentionClone(opts());
-
-    expect(createAgentSession.mock.calls[0][0].thinkingLevel).toBe("high");
+  it("keeps the parent's system prompt byte for byte", async () => {
+    await clone();
+    expect(getCurrentSystemPrompt(sentMessages())).toBe("PARENT PROMPT");
   });
 
-  it("omits the level rather than taking buildSessionContext's, which lies", async () => {
-    // getSessionContextSettings starts at "off" and moves only on an explicit
-    // thinking_level_change entry, so a session where nobody ran /think reports
-    // "off". Passing that would silently think less than the user asked for;
-    // omitting it lets createAgentSession resolve the real level from settings.
-    // Also the Pi <0.82.0 path, where ctx has no thinkingLevel at all.
-    buildSessionContext.mockReturnValue({ messages: CONVERSATION, thinkingLevel: "off", model: null } as any);
-    const o = opts({ ctx: mainCtx({ thinkingLevel: undefined }) });
-    cloneSession(callsAgent());
-
-    await runMentionClone(o);
-
-    expect(createAgentSession.mock.calls[0][0]).not.toHaveProperty("thinkingLevel");
+  it("declares the Agent tool and nothing else", async () => {
+    await clone();
+    expect(getCurrentTools(sentMessages()).map((t) => t.name)).toEqual(["Agent"]);
   });
 
-  it("clones a conversation that has not started yet", async () => {
-    // First input of a fresh session. There is no history to carry, which is an
-    // answer and not a failure — the copy still runs on the main model and
-    // system prompt, and still makes the call.
-    buildSessionContext.mockReturnValue({ messages: [], thinkingLevel: "medium", model: null } as any);
-    const o = opts();
-    const session = cloneSession(callsAgent());
-
-    const result = await runMentionClone(o);
-
-    expect(result).toEqual({ spawned: true });
-    expect(session.agent.state.messages).toEqual([]);
-    expect(session.agent.state.systemPrompt).toBe("the live system prompt");
+  it("ends with the message, then the reminder", async () => {
+    await clone();
+    const last = sentMessages().at(-1) as { role: string; content: Array<{ text: string }> };
+    expect(last.role).toBe("user");
+    expect(last.content[0].text).toBe(`check the RPC path\n\n${agentMentionReminder("Explore")}`);
   });
 
-  it("carries the live system prompt rather than the one it rebuilt", async () => {
-    // createAgentSession derives a prompt from cwd and agentDir. Close, but not
-    // what the user's model is working under — extensions add to it per turn.
-    const session = cloneSession(callsAgent());
-
-    await runMentionClone(opts());
-
-    expect(session.agent.state.systemPrompt).toBe("the live system prompt");
+  it("uses the parent's model, session id and thinking level", async () => {
+    await clone();
+    const [model, , options] = streamSimple.mock.calls[0];
+    expect(model).toBe(ctx.model);
+    expect(options).toMatchObject({ sessionId: "parent-session", reasoning: "high" });
   });
 
-  it("inherits the parent's model, thinking level and providers", async () => {
-    cloneSession(callsAgent());
-
-    await runMentionClone(opts());
-
-    const built = createAgentSession.mock.calls[0][0];
-    expect(built.model).toEqual({ id: "main-model" });
-    expect(built.thinkingLevel).toBe("high");
-    expect(built.modelRuntime).toEqual({ kind: "runtime" });
+  it("sends no reasoning level when the session thinks at off", async () => {
+    ctx.thinkingLevel = "off";
+    await clone();
+    expect(streamSimple.mock.calls[0][2]).not.toHaveProperty("reasoning");
   });
 
-  it("gives the clone the Agent tool and nothing else", async () => {
-    // It runs where nobody is watching. A full toolset would let an invisible
-    // turn read, write or run things on the user's behalf.
-    cloneSession(callsAgent());
-
-    await runMentionClone(opts());
-
-    const built = createAgentSession.mock.calls[0][0];
-    expect(built.customTools).toHaveLength(1);
-    expect(built.customTools[0].name).toBe("Agent");
-    expect(visibleTools(built).map((tool: any) => tool.name)).toEqual(["Agent"]);
-  });
-
-  it("names its own tool in the allowlist, or Pi hands it nothing", async () => {
-    // `noTools: "all"` reads like "no built-ins, keep my custom tool" and is
-    // not: it sets an EMPTY allowlist, which strips the custom tool from the
-    // registry too (agent-session.js `isAllowedTool`). The clone then has
-    // nothing to call, every mention falls through to the direct start, and the
-    // user sees "Started @x directly — the conversation clone did not start it"
-    // on every single one. Naming the tool is what makes it reachable.
-    cloneSession(callsAgent());
-
-    const result = await runMentionClone(opts());
-
-    const built = createAgentSession.mock.calls[0][0];
-    expect(built.tools).toEqual(["Agent"]);
-    expect(built.noTools).toBeUndefined();
-    expect(result).toEqual({ spawned: true });
-  });
-
-  it("prompts it with the message, then the reminder", async () => {
-    const session = cloneSession(callsAgent());
-
-    await runMentionClone(opts());
-
-    expect(session.prompt).toHaveBeenCalledWith(
-      `find the flaky test\n\n${agentMentionReminder("Explore")}`,
-    );
+  it("leaves the parent's projection untouched", async () => {
+    const before = JSON.stringify(PROJECTION);
+    await clone();
+    expect(JSON.stringify(PROJECTION)).toBe(before);
   });
 });
 
 describe("attributing the spawn to the real session", () => {
-  it("runs the real Agent handler with the MAIN context, not the fork's", async () => {
-    // The handler reads cwd, model and sessionManager.getSessionId() off this
-    // to place the .output transcript and rootSessionId. The clone's own
-    // context would file both under a session that is about to be discarded.
-    const tool = agentTool();
-    const o = opts({ agentTool: tool });
-    cloneSession(callsAgent());
-
-    await runMentionClone(o);
-
-    expect(tool.execute).toHaveBeenCalledTimes(1);
-    expect(tool.execute.mock.calls[0][4]).toBe(o.ctx);
+  it("runs the real Agent handler with the MAIN context and no tool-call id", async () => {
+    expect(await clone()).toEqual({ spawned: true });
+    const [toolCallId, , signal, , passedCtx] = agentTool.execute.mock.calls[0];
+    expect(toolCallId).toBeUndefined();
+    expect(signal.aborted).toBe(false);
+    expect(passedCtx).toBe(ctx);
   });
 
-  it("passes no tool-call id, since the real session issued none", async () => {
-    // Left on the record it becomes a <tool-use-id> in the completion
-    // notification pointing at a call the main conversation never made.
-    const tool = agentTool();
-    cloneSession(callsAgent());
-
-    await runMentionClone(opts({ agentTool: tool }));
-
-    expect(tool.execute.mock.calls[0][0]).toBeUndefined();
+  it("forwards the parameters the model chose, forced into the background", async () => {
+    reply = agentCallReply({ ...validArgs, run_in_background: false });
+    await clone();
+    expect(agentTool.execute.mock.calls[0][1]).toEqual({ ...validArgs, run_in_background: true });
   });
 
-  it("forwards the parameters the clone chose", async () => {
-    const tool = agentTool();
-    cloneSession(callsAgent({ subagent_type: "Plan", prompt: "sketch the migration" }));
-
-    await runMentionClone(opts({ agentTool: tool }));
-
-    expect(tool.execute.mock.calls[0][1]).toEqual({
-      subagent_type: "Plan",
-      prompt: "sketch the migration",
-      run_in_background: true,
-    });
+  it("honours only the first Agent call", async () => {
+    reply = agentCallReply(validArgs, fauxToolCall("Agent", { ...validArgs, prompt: "second" }));
+    await clone();
+    expect(agentTool.execute).toHaveBeenCalledTimes(1);
+    expect(agentTool.execute.mock.calls[0][1].prompt).toBe("written from context");
   });
 
-  it("forces the spawn into the background — a foreground result goes nowhere", async () => {
-    // `run_in_background` defaults to false, and a foreground agent returns its
-    // answer as the TOOL RESULT: AgentManager marks the record `resultConsumed`
-    // precisely so the completion notification is skipped as redundant. Here
-    // that tool result lands in the throwaway clone, which is disposed moments
-    // later — so the agent runs to completion, shows up in the widget and the
-    // fleet, and its answer reaches nobody. The main conversation is not part
-    // of the clone's turn, so background delivery is the only way back.
-    const tool = agentTool();
-    cloneSession(callsAgent({ subagent_type: "Explore", prompt: "go" }));
-
-    await runMentionClone(opts({ agentTool: tool }));
-
-    expect(tool.execute.mock.calls[0][1]).toMatchObject({ run_in_background: true });
-  });
-
-  it("overrides a clone that explicitly asked for a foreground run", async () => {
-    // Nothing tells the clone's model that its own turn is discarded, so an
-    // explicit `false` is a reasonable thing for it to emit. It must not decide
-    // this one.
-    const tool = agentTool();
-    cloneSession(callsAgent({ subagent_type: "Explore", prompt: "go", run_in_background: false }));
-
-    await runMentionClone(opts({ agentTool: tool }));
-
-    expect(tool.execute.mock.calls[0][1]).toMatchObject({ run_in_background: true });
-  });
-
-  it("refuses a second spawn from the same mention", async () => {
-    // One handle, one agent. A clone that decides to also launch something else
-    // would do it unseen and unasked.
-    const tool = agentTool();
-    cloneSession(async (t) => {
-      await callsAgent()(t);
-      await callsAgent()(t);
-    });
-
-    const result = await runMentionClone(opts({ agentTool: tool }));
-
-    expect(tool.execute).toHaveBeenCalledTimes(1);
-    expect(result).toEqual({ spawned: true });
-  });
-
-  it("tells the clone why the second call was refused", async () => {
-    const captured: any[] = [];
-    cloneSession(async (t) => {
-      await callsAgent()(t);
-      captured.push(await t.execute("c2", { subagent_type: "Explore", prompt: "again" }, undefined, undefined, {}));
-    });
-
-    await runMentionClone(opts());
-
-    expect(captured[0].isError).toBe(true);
-    expect(captured[0].content[0].text).toContain("Already started an agent");
+  it("applies the tool's prepareArguments before validating, as pi's loop does", async () => {
+    agentTool.prepareArguments = (args: any) => ({ ...args, prompt: `prepared: ${args.prompt}` });
+    await clone();
+    expect(agentTool.execute.mock.calls[0][1].prompt).toBe("prepared: written from context");
   });
 });
 
 describe("when the clone cannot deliver", () => {
-  it("reports a turn that never called the tool", async () => {
-    // The model answering in prose is a real outcome, and a silent one — the
-    // caller needs it to fall back rather than leave the mention unanswered.
-    cloneSession();
+  it("reports a reply that never called the tool", async () => {
+    reply = fauxAssistantMessage([fauxText("I would start Explore.")]);
+    expect(await clone()).toEqual({ spawned: false, error: "the conversation clone did not start it" });
+    expect(agentTool.execute).not.toHaveBeenCalled();
+  });
 
-    const result = await runMentionClone(opts());
+  it("reports a provider error", async () => {
+    reply = fauxAssistantMessage([], { stopReason: "error", errorMessage: "rate limited" });
+    expect(await clone()).toEqual({ spawned: false, error: "rate limited" });
+  });
 
+  it("rejects arguments that do not match the tool schema", async () => {
+    reply = agentCallReply({ description: "no prompt" });
+    const result = await clone();
     expect(result.spawned).toBe(false);
-    expect(result.error).toContain("did not start it");
+    expect(result.error).toContain("prompt");
+    expect(agentTool.execute).not.toHaveBeenCalled();
+  });
+
+  it("reports a missing model without calling anything", async () => {
+    ctx.model = undefined;
+    expect(await clone()).toEqual({ spawned: false, error: "no model is selected" });
+    expect(streamSimple).not.toHaveBeenCalled();
   });
 
   it("returns a thrown error rather than rejecting", async () => {
-    // The caller's fallback runs off the resolved value. A rejection here would
-    // land in an unhandled promise and lose the mention.
-    createAgentSession.mockRejectedValue(new Error("no provider configured"));
-
-    await expect(runMentionClone(opts())).resolves.toEqual({
-      spawned: false,
-      error: "no provider configured",
+    streamSimple.mockImplementation(() => {
+      throw new Error("no credentials");
     });
+    await expect(clone()).resolves.toEqual({ spawned: false, error: "no credentials" });
   });
 
-  it("keeps a spawn that already happened when the turn then fails", async () => {
-    // The agent is running. Reporting spawned:false would start a second one.
-    cloneSession(async (tool) => {
-      await callsAgent()(tool);
-      throw new Error("turn aborted");
-    });
-
-    const result = await runMentionClone(opts());
-
-    expect(result).toEqual({ spawned: true, error: "turn aborted" });
-  });
-
-  it("disposes the clone even when the turn throws", async () => {
-    const session = cloneSession(() => {
-      throw new Error("turn aborted");
-    });
-
-    await runMentionClone(opts());
-
-    expect(session.dispose).toHaveBeenCalled();
+  it("keeps a spawn the tool already started when the tool then throws", async () => {
+    agentTool.execute.mockRejectedValue(new Error("late failure"));
+    expect(await clone()).toEqual({ spawned: true, error: "late failure" });
   });
 });

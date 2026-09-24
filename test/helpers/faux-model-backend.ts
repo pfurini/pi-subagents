@@ -36,6 +36,9 @@ export function fauxModelBackend(model: Model<string>): {
       getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "faux", headers: {} }),
       registerProvider: () => {},
       unregisterProvider: () => {},
+      // ctx.modelRegistry.streamSimple (pi >= 0.86): the mention clone's one request.
+      stream: streamSimple,
+      streamSimple,
     },
     modelRuntime: {
       getModel: () => model,
