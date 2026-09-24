@@ -183,8 +183,9 @@ function createSession(finalText: string) {
     }),
     // pi's Agent; `beforeToolCall` is an optional, assignable hook the scope
     // installer wraps to block out-of-scope calls on turn 1.
-    agent: { beforeToolCall: undefined } as {
+    agent: { beforeToolCall: undefined, steer: vi.fn() } as {
       beforeToolCall?: (context: any, signal?: any) => Promise<any>;
+      steer: ReturnType<typeof vi.fn>;
     },
     setSessionName: vi.fn(),
     bindExtensions: vi.fn(async () => {}),
@@ -2642,7 +2643,7 @@ describe("agent-runner turn limits", () => {
 
   it("does not steer or abort below the limit", async () => {
     const { session, result } = await runWithTurns(3, { maxTurns: 5 });
-    expect(session.steer).not.toHaveBeenCalled();
+    expect(session.agent.steer).not.toHaveBeenCalled();
     expect(session.abort).not.toHaveBeenCalled();
     expect(result.steered).toBe(false);
   });
@@ -2650,8 +2651,11 @@ describe("agent-runner turn limits", () => {
   it("steers exactly once on reaching the limit, and does not abort", async () => {
     setGraceTurns(5);
     const { session, result } = await runWithTurns(5, { maxTurns: 5 });
-    expect(session.steer).toHaveBeenCalledTimes(1);
-    expect(session.steer.mock.calls[0][0]).toContain("turn limit");
+    expect(session.agent.steer).toHaveBeenCalledTimes(1);
+    expect(session.agent.steer.mock.calls[0][0]).toMatchObject({
+      role: "user",
+      content: [{ type: "text", text: expect.stringContaining("turn limit") }],
+    });
     expect(session.abort).not.toHaveBeenCalled();
     expect(result.steered).toBe(true);
   });
@@ -2661,14 +2665,14 @@ describe("agent-runner turn limits", () => {
     // which both burns tokens and drowns out its actual task.
     setGraceTurns(5);
     const { session } = await runWithTurns(8, { maxTurns: 5 });
-    expect(session.steer).toHaveBeenCalledTimes(1);
+    expect(session.agent.steer).toHaveBeenCalledTimes(1);
     expect(session.abort).not.toHaveBeenCalled();
   });
 
   it("hard-aborts once the grace turns are used up", async () => {
     setGraceTurns(2);
     const { session, result } = await runWithTurns(7, { maxTurns: 5 });
-    expect(session.steer).toHaveBeenCalledTimes(1);
+    expect(session.agent.steer).toHaveBeenCalledTimes(1);
     expect(session.abort).toHaveBeenCalled();
     expect(result.aborted).toBe(true);
   });
@@ -2683,14 +2687,14 @@ describe("agent-runner turn limits", () => {
 
   it("treats maxTurns 0 as unlimited", async () => {
     const { session } = await runWithTurns(30, { maxTurns: 0 });
-    expect(session.steer).not.toHaveBeenCalled();
+    expect(session.agent.steer).not.toHaveBeenCalled();
     expect(session.abort).not.toHaveBeenCalled();
   });
 
   it("is unlimited when nothing configures a limit", async () => {
     setDefaultMaxTurns(undefined);
     const { session } = await runWithTurns(30);
-    expect(session.steer).not.toHaveBeenCalled();
+    expect(session.agent.steer).not.toHaveBeenCalled();
     expect(session.abort).not.toHaveBeenCalled();
   });
 
@@ -2698,14 +2702,14 @@ describe("agent-runner turn limits", () => {
     setDefaultMaxTurns(4);
     setGraceTurns(5);
     const { session } = await runWithTurns(4);
-    expect(session.steer).toHaveBeenCalledTimes(1);
+    expect(session.agent.steer).toHaveBeenCalledTimes(1);
   });
 
   it("an explicit maxTurns beats the global default", async () => {
     setDefaultMaxTurns(2);
     setGraceTurns(5);
     const { session } = await runWithTurns(4, { maxTurns: 10 });
-    expect(session.steer).not.toHaveBeenCalled();
+    expect(session.agent.steer).not.toHaveBeenCalled();
   });
 
   it("reports each turn to the caller's counter", async () => {

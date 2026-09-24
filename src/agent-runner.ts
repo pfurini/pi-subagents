@@ -5,7 +5,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import type { Model } from "@earendil-works/pi-ai";
+import type { Model, UserMessage } from "@earendil-works/pi-ai";
 import type { ExtensionContext, LoadExtensionsResult } from "@earendil-works/pi-coding-agent";
 import {
   type AgentSession,
@@ -348,6 +348,13 @@ let rememberAgents = true;
 export function getRememberAgents(): boolean { return rememberAgents; }
 /** Set whether subagent sessions are persisted by default. */
 export function setRememberAgents(b: boolean): void { rememberAgents = b; }
+
+/** The wrap-up instruction a run receives once, at its soft turn limit. */
+export const TURN_LIMIT_STEER = "You have reached your turn limit. Wrap up immediately — provide your final answer now.";
+
+function turnLimitMessage(): UserMessage {
+  return { role: "user", content: [{ type: "text", text: TURN_LIMIT_STEER }], timestamp: Date.now() };
+}
 
 /** Additional turns allowed after the soft limit steer message. */
 let graceTurns = 5;
@@ -1140,7 +1147,10 @@ async function runAgentWithLoader(
       if (maxTurns != null) {
         if (!softLimitReached && turnCount >= maxTurns) {
           softLimitReached = true;
-          session.steer("You have reached your turn limit. Wrap up immediately — provide your final answer now.");
+          // Queued on the agent, not through `session.steer`: since pi 0.86 that
+          // awaits every extension `input` handler before queueing, and this
+          // listener is not awaited, so the loop's steering poll could run first.
+          session.agent.steer(turnLimitMessage());
         } else if (softLimitReached && turnCount >= maxTurns + graceTurns) {
           aborted = true;
           session.abort();
