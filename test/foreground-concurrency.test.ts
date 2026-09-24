@@ -362,7 +362,7 @@ describe("maxConcurrentForeground", () => {
       const queued = fg(manager, "victim");
 
       manager.abortAll();
-      expect((await queued).record.status).toBe("stopped");
+      expect((await queued).record.status).toBe("aborted");
     });
 
     // Without this, `afterEach(() => manager.dispose())` turns any failing test

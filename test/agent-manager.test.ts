@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { AgentManager } from "../src/agent-manager.js";
+import { AgentManager, SESSION_ENDED_ERROR } from "../src/agent-manager.js";
 import type { AgentRecord } from "../src/types.js";
 
 vi.mock("../src/agent-runner.js", () => ({
@@ -1497,29 +1497,92 @@ describe("AgentManager — listAgents() ordering", () => {
   });
 });
 
+// abortAll() runs when the session that owns the agents ends. The session's event
+// bus goes with it, so the end of every agent has to be reported inside the call,
+// not when the aborted run gets round to settling.
 describe("AgentManager — abortAll", () => {
   let manager: AgentManager;
   afterEach(() => manager?.dispose());
 
-  it("stops both queued and running agents and returns the total count", () => {
-    manager = new AgentManager(undefined, 1);
-    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
+  /** A run that settles only when the test says so. */
+  function heldRuns() {
+    const settle: Array<(outcome: { responseText: string; aborted: boolean }) => void> = [];
+    const fail: Array<(err: Error) => void> = [];
+    vi.mocked(runAgent).mockImplementation(() => new Promise((resolve, reject) => {
+      settle.push(outcome => resolve({ ...outcome, session: mockSession(), steered: false }));
+      fail.push(reject);
+    }));
+    return { settle, fail };
+  }
 
-    const running = manager.spawn(mockPi, mockCtx, "X", "r", {
-      description: "r",
-      isBackground: true,
-    });
-    const queued = manager.spawn(mockPi, mockCtx, "Y", "q", {
-      description: "q",
-      isBackground: true,
-    });
-    expect(manager.getRecord(running)?.status).toBe("running");
+  it("ends queued and running agents as aborted, reports each once, and returns the count", () => {
+    const onComplete = vi.fn();
+    manager = new AgentManager(onComplete, 1);
+    heldRuns();
+    const running = manager.spawn(mockPi, mockCtx, "X", "r", { description: "r", isBackground: true });
+    const queued = manager.spawn(mockPi, mockCtx, "Y", "q", { description: "q", isBackground: true });
     expect(manager.getRecord(queued)?.status).toBe("queued");
 
     expect(manager.abortAll()).toBe(2);
-    expect(manager.getRecord(running)?.status).toBe("stopped");
-    expect(manager.getRecord(queued)?.status).toBe("stopped");
+    for (const id of [running, queued]) {
+      expect(manager.getRecord(id)).toMatchObject({ status: "aborted", error: SESSION_ENDED_ERROR, resultConsumed: true });
+    }
+    expect(onComplete.mock.calls.map(([record]) => record.id).sort()).toEqual([running, queued].sort());
+    expect(manager.getRecord(running)?.abortController?.signal.aborted).toBe(true);
     expect(manager.hasRunning()).toBe(false);
+  });
+
+  it("does not report a run again, or change its status, when it settles afterwards", async () => {
+    const onComplete = vi.fn();
+    manager = new AgentManager(onComplete);
+    const runs = heldRuns();
+    const id = manager.spawn(mockPi, mockCtx, "X", "r", { description: "r", isBackground: true });
+    manager.abortAll();
+    onComplete.mockClear();
+
+    runs.settle[0]({ responseText: "late", aborted: false });
+    await manager.getRecord(id)!.promise;
+    expect(onComplete).not.toHaveBeenCalled();
+    expect(manager.getRecord(id)).toMatchObject({ status: "aborted", error: SESSION_ENDED_ERROR });
+  });
+
+  it("does not report a run again when it rejects afterwards", async () => {
+    const onComplete = vi.fn();
+    manager = new AgentManager(onComplete);
+    const runs = heldRuns();
+    const id = manager.spawn(mockPi, mockCtx, "X", "r", { description: "r", isBackground: true });
+    manager.abortAll();
+    onComplete.mockClear();
+
+    runs.fail[0](new Error("aborted by signal"));
+    await manager.getRecord(id)!.promise;
+    expect(onComplete).not.toHaveBeenCalled();
+    expect(manager.getRecord(id)?.status).toBe("aborted");
+  });
+
+  it("reports a resumed run once, and lets a later resume report again", async () => {
+    const onComplete = vi.fn();
+    manager = new AgentManager(onComplete);
+    vi.mocked(runAgent).mockResolvedValue({ responseText: "first", session: mockSession(), aborted: false, steered: false });
+    const id = manager.spawn(mockPi, mockCtx, "X", "r", { description: "r", isBackground: true });
+    await manager.getRecord(id)!.promise;
+
+    let finish!: (value: { text: string }) => void;
+    vi.mocked(resumeAgent).mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    await manager.resume(id, "again", undefined, { isBackground: true });
+    onComplete.mockClear();
+    manager.abortAll();
+    expect(onComplete).toHaveBeenCalledTimes(1);
+    finish({ text: "late" });
+    await manager.getRecord(id)!.promise;
+    expect(onComplete).toHaveBeenCalledTimes(1);
+    expect(manager.getRecord(id)?.status).toBe("aborted");
+
+    vi.mocked(resumeAgent).mockResolvedValue({ text: "third" });
+    await manager.resume(id, "once more", undefined, { isBackground: true });
+    await manager.getRecord(id)!.promise;
+    expect(onComplete).toHaveBeenCalledTimes(2);
+    expect(manager.getRecord(id)?.status).toBe("completed");
   });
 
   it("returns 0 when there are no running or queued agents", () => {

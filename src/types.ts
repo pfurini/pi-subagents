@@ -224,6 +224,13 @@ export interface AgentRecord {
   joinMode?: JoinMode;
   /** Set when result was already consumed via get_subagent_result — suppresses completion notification. */
   resultConsumed?: boolean;
+  /**
+   * The run's end was already reported through `onComplete`, before the run itself
+   * settled. Only `abortAll()` sets it: the session ending is reported at once, while
+   * the session can still deliver the events, and the settle that follows must
+   * neither report again nor change the reported status.
+   */
+  endReported?: boolean;
   /** Steering messages queued before the session was ready. */
   pendingSteers?: string[];
   /** Worktree info if the agent is running in an isolated worktree. */

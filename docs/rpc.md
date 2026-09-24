@@ -164,6 +164,17 @@ The consequence is worth stating plainly: **a session that excludes pi-subagents
 
 One more trap on the way in: an RPC-spawned agent emits **no `subagents:created`**. The only two emit sites are the `Agent` tool's background branch (`src/index.ts:2210`) and detached resume (`:1453`). Your first event for your own agent is `subagents:started` (`:690`), so key your bookkeeping off the id that `spawn` handed you, not off `subagents:created`.
 
+## When the session ends
+
+Ending a session (`/new`, `/resume`, `/fork`, `/reload`, quit) aborts every queued and running top-level agent. The next session starts with a fresh extension instance and a fresh bus, so nothing outlives the session it was spawned in.
+
+Each agent cut short this way is reported inside `session_shutdown`, while the bus still works: `subagents:failed` and `subagents:agent-ended` carry status `aborted` and the error `The session ended before the agent finished.` (`SESSION_ENDED_ERROR` in `src/agent-manager.ts`). The run itself settles later and reports nothing more. No completion notification is sent, because no session is left to take it.
+
+Two things follow for a consumer:
+
+- **Treat `aborted` as "did not finish"**, not as a deliberate stop. `stopped` always means someone chose to stop the agent.
+- **The report may reach you after your own `session_shutdown` handler has run.** Extensions shut down in load order, so an extension loaded before pi-subagents has already run its handler. Its bus subscriptions still receive the report, so any state that outlives the session should be read after every handler has finished, not captured in your own.
+
 ## What the tests pin
 
 This document has no test of its own, so it is worth knowing which claims are actually held in place:
@@ -173,6 +184,7 @@ This document has no test of its own, so it is worth knowing which claims are ac
 | `test/cross-extension-rpc.test.ts` | Mocked `SpawnCapable` | Envelope shape, per-channel errors, model resolution and scope enforcement, v3 capability discovery, and reply-before-`agent-ended` ordering on successful and failed startup |
 | `test/rpc-lifecycle-gating.test.ts` | Real extension factory | Nothing wired at factory time, everything once at `session_start`, and live widget activity for RPC spawns ([#142](https://github.com/tintinweb/pi-subagents/issues/142)/[#181](https://github.com/tintinweb/pi-subagents/pull/181)) |
 | `test/rpc-result-consumption.test.ts` | Real delivery path | The notification firing, and not firing, around `consume` |
+| `test/agent-ended-statuses.test.ts` | Real extension factory | One terminal event per agent on every terminal path, including agents the session's end cuts short, reported before `session_shutdown` returns |
 
 Not pinned anywhere, so treat them as descriptions rather than contracts: the `SpawnOptions.cwd` error strings, consume's handle resolution, and its missing `workflowId` check.
 

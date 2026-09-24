@@ -21,6 +21,7 @@ vi.mock("../src/agent-runner.js", async () => {
   return { ...actual, runAgent: vi.fn() };
 });
 
+import { SESSION_ENDED_ERROR } from "../src/agent-manager.js";
 import { runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
 
@@ -189,5 +190,44 @@ describe("subagents:agent-ended (v3) terminal statuses", () => {
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({ agentId: queued, status: "stopped" });
     expect(channelsFor(pi, "subagents:completed", "subagents:failed")).toEqual(["subagents:failed"]);
+  });
+
+  // The session's event bus goes away with the session. An aborted run settles later
+  // than that, so its end is reported before the shutdown handler returns, or never.
+  it("emits aborted once for every agent the session's end cuts short, before shutdown returns", async () => {
+    const settle: Array<() => void> = [];
+    (runAgent as any).mockImplementation(() => new Promise(resolve => {
+      settle.push(() => resolve({ responseText: "late", session: undefined, aborted: true, steered: false, failure: undefined }));
+    }));
+    const { pi, busHandlers, lifecycle } = await boot();
+    const manager = (globalThis as any)[MANAGER_KEY];
+
+    const ids: string[] = [];
+    for (let i = 0; i < 12; i++) {
+      await busHandlers.get("subagents:rpc:spawn")!({
+        requestId: `end-${i}`,
+        type: "general-purpose",
+        prompt: "go",
+        options: { description: "cut short", isBackground: true },
+      });
+      const reply = pi.events.emit.mock.calls.find((c: any[]) => c[0] === `subagents:rpc:spawn:reply:end-${i}`);
+      ids.push(reply![1].data.id);
+    }
+    expect(ids.some(id => manager.getRecord(id)?.status === "queued"), "expected a queued agent too").toBe(true);
+    expect(endedEvents(pi)).toHaveLength(0);
+
+    const shutdown = lifecycle.get("session_shutdown")();
+    // Nothing awaited yet: the reports must already be out.
+    const failed = pi.events.emit.mock.calls.filter((c: any[]) => c[0] === "subagents:failed").map((c: any[]) => c[1]);
+    expect(failed.map((event: any) => event.id).sort()).toEqual([...ids].sort());
+    for (const event of failed) expect(event).toMatchObject({ status: "aborted", error: SESSION_ENDED_ERROR });
+    expect(endedEvents(pi).map((event: any) => event.status)).toEqual(ids.map(() => "aborted"));
+
+    await shutdown;
+    for (const finish of settle) finish();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(endedEvents(pi)).toHaveLength(ids.length);
+    expect(channelsFor(pi, "subagents:completed", "subagents:failed")).toHaveLength(ids.length);
+    expect(pi.sendMessage).not.toHaveBeenCalled();
   });
 });

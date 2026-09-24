@@ -73,6 +73,9 @@ const DEFAULT_MAX_CONCURRENT_FOREGROUND = 0;
  */
 const MAX_TOMBSTONES = 100;
 
+/** The error an agent carries when `abortAll()` ends it because its session ended. */
+export const SESSION_ENDED_ERROR = "The session ended before the agent finished.";
+
 /**
  * Validate a caller-supplied SpawnOptions.cwd. `undefined`/`null` mean "unset"
  * (parent cwd). Anything else must be an absolute path to an existing
@@ -847,8 +850,9 @@ export class AgentManager {
       },
     })
       .then(async ({ responseText, session, aborted, steered, failure, structuredJson, structuredRetried }) => {
-        // Don't overwrite status if externally stopped via abort()
-        if (record.status !== "stopped") {
+        // Don't overwrite status if externally stopped via abort(), or already
+        // reported by abortAll()
+        if (record.status !== "stopped" && !record.endReported) {
           // Precedence: a hard abort keeps "aborted"; then a failed final turn
           // (provider error that pi resolved instead of rejecting, #144) is an
           // honest "error" — not a completion with an empty or stale result.
@@ -908,8 +912,9 @@ export class AgentManager {
         return responseText;
       })
       .catch(async (err) => {
-        // Don't overwrite status if externally stopped via abort()
-        if (record.status !== "stopped") {
+        // Don't overwrite status if externally stopped via abort(), or already
+        // reported by abortAll()
+        if (record.status !== "stopped" && !record.endReported) {
           record.status = "error";
         }
         record.error = err instanceof Error ? err.message : String(err);
@@ -970,10 +975,13 @@ export class AgentManager {
     if (pool === "background") this.runningBackground--;
     else if (pool === "foreground") this.runningForeground--;
 
-    if (guardCallback) {
-      try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
-    } else {
-      this.onComplete?.(record);
+    // abortAll() already reported this end, while the session could still deliver it.
+    if (!record.endReported) {
+      if (guardCallback) {
+        try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
+      } else {
+        this.onComplete?.(record);
+      }
     }
 
     // The isBackground half reproduces the pre-pool condition exactly — a
@@ -1133,6 +1141,7 @@ export class AgentManager {
 
       record.isBackground = true;
       record.resultConsumed = false;
+      record.endReported = undefined;
       record.result = undefined;
       record.error = undefined;
       record.completedAt = undefined;
@@ -1261,7 +1270,10 @@ export class AgentManager {
       // Children spawned during the resumed turn must not outlive it.
       this.abortOwnedChildren(id);
       if (occupiesPoolSlot(record)) this.runningBackground--;
-      try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
+      // abortAll() already reported this end, while the session could still deliver it.
+      if (!record.endReported) {
+        try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
+      }
       this.drainQueue();
     };
 
@@ -1283,8 +1295,9 @@ export class AgentManager {
       signal: abortController.signal,
     })
       .then(({ text, failure }) => {
-        // Don't overwrite status if externally stopped via abort().
-        if (record.status !== "stopped") {
+        // Don't overwrite status if externally stopped via abort(), or already
+        // reported by abortAll().
+        if (record.status !== "stopped" && !record.endReported) {
           // Same contract as the spawn path (#144): a failed final turn is an
           // error, not a completion — but the resumed text stays available.
           record.status = failure ? "error" : "completed";
@@ -1296,7 +1309,7 @@ export class AgentManager {
         return text;
       })
       .catch((err) => {
-        if (record.status !== "stopped") {
+        if (record.status !== "stopped" && !record.endReported) {
           record.status = "error";
           record.error = err instanceof Error ? err.message : String(err);
         }
@@ -1516,29 +1529,40 @@ export class AgentManager {
     );
   }
 
-  /** Abort all running and queued agents immediately. */
+  /**
+   * End every queued and running agent because the session that owns them is ending.
+   *
+   * Each one settles as `aborted` with `SESSION_ENDED_ERROR`, and is reported through
+   * `onComplete` here and now. A running agent's run settles asynchronously, after the
+   * session and its event bus are gone, so a report left to the settle path would
+   * reach nobody; `endReported` then keeps that path from reporting it again. Unlike
+   * `abort()`, nobody asked for these agents to stop, so they are not `stopped`.
+   * Nothing is left to deliver a notification to, so every record is consumed.
+   */
   abortAll(): number {
-    let count = 0;
-    // Clear queued agents first
+    const ended: AgentRecord[] = [];
     for (const queued of this.queue) {
       const record = this.agents.get(queued.id);
-      if (record) {
-        record.status = "stopped";
-        record.completedAt = Date.now();
-        count++;
-      }
+      if (record) ended.push(record);
+    }
+    for (const record of this.agents.values()) {
+      if (record.status === "running") ended.push(record);
+    }
+    // Settled before the queue is released: a caller woken by `dequeue` reads the
+    // record's final status.
+    for (const record of ended) {
+      record.status = "aborted";
+      record.error = SESSION_ENDED_ERROR;
+      record.completedAt = Date.now();
+      record.resultConsumed = true;
+      record.endReported = true;
     }
     this.dequeue(() => true);
-    // Abort running agents
-    for (const record of this.agents.values()) {
-      if (record.status === "running") {
-        record.abortController?.abort();
-        record.status = "stopped";
-        record.completedAt = Date.now();
-        count++;
-      }
+    for (const record of ended) {
+      record.abortController?.abort();
+      try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
     }
-    return count;
+    return ended.length;
   }
 
   /** Wait for all running and queued agents to complete (including queued ones). */

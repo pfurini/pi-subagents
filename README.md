@@ -554,7 +554,7 @@ Instead of hard-aborting at the turn limit, agents get a graceful shutdown:
 |--------|---------|------|
 | `completed` | Finished naturally | `✓` green |
 | `steered` | Hit limit, wrapped up in time | `✓` yellow |
-| `aborted` | Grace period exceeded | `✗` red |
+| `aborted` | Grace period exceeded, or the session ended while the agent was queued or running | `✗` red |
 | `stopped` | User-initiated abort | `■` dim |
 
 ## Concurrency
