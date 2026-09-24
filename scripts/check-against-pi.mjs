@@ -10,8 +10,10 @@
  * workspace packages over the pinned ones, and runs `tsc` and `vitest` there.
  * The repo itself is never modified.
  *
- * Usage: node scripts/check-against-pi.mjs [<checkout>] [--keep] [-- <vitest args>]
+ * Usage: node scripts/check-against-pi.mjs [--checkout=<dir>] [--keep] [<vitest args>]
  * The checkout defaults to $PI_CHECKOUT, then to ../pi. It must be built.
+ * Every other argument goes to vitest, so `npm run check:pi -- <file>` runs one
+ * file; a bare `--` is dropped.
  */
 import { spawnSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync } from "node:fs";
@@ -20,12 +22,11 @@ import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const argv = process.argv.slice(2);
-const dashDash = argv.indexOf("--");
-const ownArgs = dashDash === -1 ? argv : argv.slice(0, dashDash);
-const vitestArgs = dashDash === -1 ? [] : argv.slice(dashDash + 1);
-const keep = ownArgs.includes("--keep");
-const checkout = resolve(repo, ownArgs.find((a) => !a.startsWith("--")) ?? process.env.PI_CHECKOUT ?? "../pi");
+const argv = process.argv.slice(2).filter((a) => a !== "--");
+const keep = argv.includes("--keep");
+const checkoutArg = argv.find((a) => a.startsWith("--checkout="));
+const vitestArgs = argv.filter((a) => a !== "--keep" && a !== checkoutArg);
+const checkout = resolve(repo, checkoutArg?.slice("--checkout=".length) ?? process.env.PI_CHECKOUT ?? "../pi");
 
 function fail(message) {
   console.error(`check-against-pi: ${message}`);
